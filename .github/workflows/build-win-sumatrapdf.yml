@@ -1,12 +1,12 @@
 name: build-win-sumatrapdf
-
+ 
 on:
   workflow_dispatch:
-
+ 
 env:
   BUILD_DATE: ''
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
+ 
 jobs:
   build:
     # Official CI uses this exact label: build.ts detects VS2026 internally
@@ -18,12 +18,12 @@ jobs:
       # upstream would clobber this.
       - name: Checkout CI repo (self)
         uses: actions/checkout@v5
-
+ 
       - name: Generate timestamp
         shell: bash
         run: |
           echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
-
+ 
       # === Upstream to subpath (NOT root — root would erase the action) ===
       # SumatraPDF is self-contained: all 3rd-party deps vendored in this
       # one repo. fetch-depth: 0 because build number / git describe need
@@ -35,7 +35,7 @@ jobs:
           ref: master
           path: sumatrapdf
           fetch-depth: 0
-
+ 
       # === Version (best-effort from git tags) ===
       - name: Resolve version
         shell: bash
@@ -49,11 +49,11 @@ jobs:
           fi
           echo "SUMATRA_VERSION=$VER" >> $GITHUB_ENV
           echo "Version: $VER"
-
+ 
       # === Official toolchain entry: bun + cmd/build.ts ===
       - name: Install bun
         uses: oven-sh/setup-bun@v2
-
+ 
       # -rel = Release x64 build (NOT -ci: that mode expects the official
       # repo's R2/BB upload secrets we don't have). build.ts issues msbuild
       # with RELATIVE paths (vs2022\SumatraPDF.sln), so cwd MUST be the
@@ -61,7 +61,7 @@ jobs:
       - name: Build (Release x64)
         run: bun .\cmd\build.ts -rel
         working-directory: sumatrapdf
-
+ 
       # === Verify output (fail fast) ===
       # Output is generated under the repo's cwd: sumatrapdf/out/rel64/
       - name: Verify output (x64)
@@ -77,7 +77,7 @@ jobs:
           echo "=== Built ==="
           ls -la sumatrapdf/out/rel64/
           sha256sum sumatrapdf/out/rel64/SumatraPDF.exe
-
+ 
       # === Rename and move (Ventoy-style) ===
       # Copy the whole rel64 dir: SumatraPDF.exe needs its dll companions
       # (libsumatrapdf.dll etc.) — dynamic dependencies, not optional.
@@ -85,17 +85,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          DEST="${{ github.workspace }}/dist/SumatraPDF-${{ env.SUMATRA_VERSION }}-x64-${{ env.BUILD_DATE }}"
+          DEST="${{ github.workspace }}/dist/sumatrapdf-${{ env.BUILD_DATE }}"
           mkdir -p "$DEST"
           cp -r sumatrapdf/out/rel64/. "$DEST/"
           echo "=== Staged package ==="
           find "$DEST" -type f | sort
-
+ 
       # === Encrypt package and create release (Ventoy-style) ===
       - name: Encrypt package and create release
         uses: ./.github/actions/aes256pac_release/
         with:
           ZIP_AES256_PWD: ${{ secrets.ZIP_AES256_PWD }}
           ZIP_COMPRESS_LEVEL: '9'
-          BUILD_ARTIFACT_PATH: "./dist/SumatraPDF-${{ env.SUMATRA_VERSION }}-x64-${{ env.BUILD_DATE }}"
-          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-sumatrapdf-${{ env.SUMATRA_VERSION }}-x64"
+          BUILD_ARTIFACT_PATH: "./dist/sumatrapdf-${{ env.BUILD_DATE }}"
+          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-sumatrapdf"

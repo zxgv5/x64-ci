@@ -9,13 +9,8 @@ env:
  
 jobs:
   build:
-    # Official CI uses this exact label: build.ts detects VS2026 internally
-    # (detectVisualStudio2026). GA since May 2026, no special access needed.
     runs-on: windows-2025-vs2026
     steps:
-      # === Checkout SELF first (root) — brings .github/actions/ with the
-      # release action. Upstream goes to a subpath; root checkout of
-      # upstream would clobber this.
       - name: Checkout CI repo (self)
         uses: actions/checkout@v5
  
@@ -24,10 +19,6 @@ jobs:
         run: |
           echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
  
-      # === Upstream to subpath (NOT root — root would erase the action) ===
-      # SumatraPDF is self-contained: all 3rd-party deps vendored in this
-      # one repo. fetch-depth: 0 because build number / git describe need
-      # history.
       - name: Checkout SumatraPDF
         uses: actions/checkout@v5
         with:
@@ -36,7 +27,6 @@ jobs:
           path: sumatrapdf
           fetch-depth: 0
  
-      # === Version (best-effort from git tags) ===
       - name: Resolve version
         shell: bash
         run: |
@@ -50,20 +40,13 @@ jobs:
           echo "SUMATRA_VERSION=$VER" >> $GITHUB_ENV
           echo "Version: $VER"
  
-      # === Official toolchain entry: bun + cmd/build.ts ===
       - name: Install bun
         uses: oven-sh/setup-bun@v2
  
-      # -rel = Release x64 build (NOT -ci: that mode expects the official
-      # repo's R2/BB upload secrets we don't have). build.ts issues msbuild
-      # with RELATIVE paths (vs2022\SumatraPDF.sln), so cwd MUST be the
-      # repo root — hence working-directory, not a path-prefixed command.
       - name: Build (Release x64)
         run: bun .\cmd\build.ts -rel
         working-directory: sumatrapdf
  
-      # === Verify output (fail fast) ===
-      # Output is generated under the repo's cwd: sumatrapdf/out/rel64/
       - name: Verify output (x64)
         shell: bash
         run: |
@@ -78,9 +61,6 @@ jobs:
           ls -la sumatrapdf/out/rel64/
           sha256sum sumatrapdf/out/rel64/SumatraPDF.exe
  
-      # === Rename and move (Ventoy-style) ===
-      # Copy the whole rel64 dir: SumatraPDF.exe needs its dll companions
-      # (libsumatrapdf.dll etc.) — dynamic dependencies, not optional.
       - name: Rename and move
         shell: bash
         run: |
@@ -91,7 +71,6 @@ jobs:
           echo "=== Staged package ==="
           find "$DEST" -type f | sort
  
-      # === Encrypt package and create release (Ventoy-style) ===
       - name: Encrypt package and create release
         uses: ./.github/actions/aes256pac_release/
         with:

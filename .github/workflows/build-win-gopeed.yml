@@ -1,12 +1,12 @@
 name: build-win-gopeed
-
+ 
 on:
   workflow_dispatch:
   workflow_call:
-
+ 
 env:
   GITHUB_TOKEN: ${{secrets.GITHUB_TOKEN}}
-
+ 
 jobs:
   build:
     # 与官方 build-windows 的 amd64 矩阵行一致，钉 windows-2022 而非 latest
@@ -20,43 +20,43 @@ jobs:
           ref: main
           path: gopeed_source
           fetch-depth: 0
-
+ 
       - name: Checkout ci source repo
         uses: actions/checkout@main
         with:
           path: ci_source
-
+ 
       - name: Generate timestamp
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
-
+ 
       # flutter_inappwebview 等 git override 依赖在 pub 缓存目录下 checkout 时
       # 路径超过 Win32 MAX_PATH(260)，需放开 git 的长路径限制
       - name: Enable git long paths
         shell: bash
         run: git config --global core.longpaths true
-
+ 
       - name: Setup go
         uses: actions/setup-go@main
         with:
           go-version: "1.26"
           cache: true
           cache-dependency-path: ./gopeed_source/go.sum
-
+ 
       - name: Setup flutter
         uses: subosito/flutter-action@main
         with:
           channel: stable
           flutter-version: "3.41.6"
           cache: true
-
+ 
       # 官方setup.iss引用了简体中文语言包，Inno Setup 6 runner镜像预装但缺这一文件
       - name: Prepare inno setup language
         shell: pwsh
         run: |
           Invoke-WebRequest -Uri "https://github.com/jrsoftware/issrc/raw/main/Files/Languages/ChineseSimplified.isl" -OutFile "ChineseSimplified.isl"
           mv ChineseSimplified.isl "C:\Program Files (x86)\Inno Setup 6\Languages\"
-
+ 
       # Windows桌面侧不需要gomobile：Go核心以c-shared DLL形式构建（依赖
       # runner预装的gcc满足CGO），host/updater为纯Go工具，随assets打包
       - name: Build go core and tools
@@ -68,7 +68,7 @@ jobs:
           go build -tags nosqlite -ldflags="-w -s -X github.com/GopeedLab/gopeed/pkg/base.Version=$VERSION" -buildmode=c-shared -o ui/flutter/windows/libgopeed.dll github.com/GopeedLab/gopeed/bind/desktop
           go build -ldflags="-w -s" -o ui/flutter/assets/exec/host.exe github.com/GopeedLab/gopeed/cmd/host
           go build -ldflags="-w -s" -o ui/flutter/assets/exec/updater.exe github.com/GopeedLab/gopeed/cmd/updater
-
+ 
       # 产物一：便携版zip（UPDATE_CHANNEL决定应用内更新检查指向）
       - name: Flutter build windows (portable)
         working-directory: ./gopeed_source/ui/flutter
@@ -76,8 +76,34 @@ jobs:
         run: |
           flutter build windows --dart-define="UPDATE_CHANNEL=windowsPortable"
           $release = "build\windows\x64\runner\Release\"
-          # libgopeed.dll 由镜像预装的 gcc(Strawberry Perl) 链接，运行时 DLL
-          # 应从同源目录取（新版 Git for Windows 已不再携带这些 DLL）
+
+          # === 诊断 1：构建刚结束时 Release 里的 DLL ===
+          Write-Host "=== DLLs in Release (before salvage) ==="
+          Get-ChildItem $release -Filter *.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+
+          # === 兜底收集：全构建树搜集 *_plugin.dll，补齐 Release 缺失 ===
+          # 各插件 windows/CMakeLists.txt 的 RUNTIME_OUTPUT_DIRECTORY 写法不一，
+          # 当前依赖组合下部分插件的 DLL 可能落在 build\windows\x64\<plugin>\ 等
+          # 位置而非 runner\Release\。递归搜集统一拷回 exe 旁（加载器搜索路径）。
+          $salvaged = Get-ChildItem "build\windows" -Recurse -Filter "*_plugin.dll" |
+            Where-Object { $_.DirectoryName -notlike "*runner\Release*" }
+          foreach ($dll in $salvaged) {
+            if (-not (Test-Path (Join-Path $release $dll.Name))) {
+              Copy-Item $dll.FullName $release
+              Write-Host "SALVAGED: $($dll.FullName) -> $release"
+            }
+          }
+          Write-Host "=== DLLs in Release (after salvage) ==="
+          Get-ChildItem $release -Filter *.dll | ForEach-Object { Write-Host "  $($_.Name)" }
+
+          # === 诊断 2：CMake 实际集成的插件全集（= .flutter-plugins-dependencies 的 windows 列表）===
+          $symlinks = "windows\flutter\ephemeral\.plugin_symlinks"
+          if (Test-Path $symlinks) {
+            Write-Host "=== plugins registered for windows build ==="
+            Get-ChildItem $symlinks | ForEach-Object { Write-Host "  $($_.Name)" }
+          }
+
+          # === 原有运行时 DLL 补齐（不变）===
           $mingwCandidates = @("C:\Strawberry\c\bin", "C:\Program Files\Git\mingw64\bin")
           foreach ($dll in @("libstdc++-6.dll","libgcc_s_seh-1.dll","libwinpthread-1.dll")) {
             $copied = $false
@@ -96,7 +122,7 @@ jobs:
           cp $system\vcruntime140_1.dll $release
           New-Item -Path build\windows\Output -ItemType Directory
           Compress-Archive -Path "$release*" -DestinationPath "build\windows\Output\Gopeed-v$env:VERSION-windows-amd64-portable.zip"
-
+ 
       # 产物二：安装包exe（再zip），iscc.exe由runner镜像预装
       - name: Flutter build windows (installer)
         working-directory: ./gopeed_source/ui/flutter
@@ -111,7 +137,7 @@ jobs:
           #define MyAppPublisher "monkeyWie"
           #define MyAppURL "https://gopeed.com"
           #define MyAppExeName "gopeed.exe"
-
+ 
           [Setup]
           AppId={{5960F34D-1E42-402C-8C85-DE2FF24CBAE4}
           AppName={#MyAppName}
@@ -133,31 +159,31 @@ jobs:
           LanguageDetectionMethod=uilanguage
           ShowLanguageDialog=yes
           CloseApplications=force
-
+ 
           [Languages]
           Name: "english"; MessagesFile: "compiler:Default.isl"
           Name: "chinesesimplified"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
-
+ 
           [Tasks]
           Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
-
+ 
           [Files]
           Source: ".\x64\runner\Release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs;
-
+ 
           [UninstallDelete]
           Type: filesandordirs; Name: "{app}"
-
+ 
           [Icons]
           Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
           Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
-
+ 
           [Run]
           Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
           "@ > setup.iss
           iscc.exe setup.iss
           mv "Output\gopeed.exe" "Output\Gopeed-v$env:VERSION-windows-amd64.exe"
           Compress-Archive -Path "Output\Gopeed-v$env:VERSION-windows-amd64.exe" -DestinationPath "Output\Gopeed-v$env:VERSION-windows-amd64.zip"
-
+ 
       - name: Rename and move
         shell: bash
         run: |
@@ -176,7 +202,7 @@ jobs:
           fi
           cp -v "${files[@]}" "$DEST/"
           find "$DEST" -type f | sort
-
+ 
       # === Release（与 AHK 同一 action：Windows 官方不做代码签名，无 keystore 需清除）===
       - name: Encrypt package and create release
         uses: ./ci_source/.github/actions/aes256pac_release/

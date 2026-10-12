@@ -30,6 +30,12 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
+      # flutter_inappwebview 等 git override 依赖在 pub 缓存目录下 checkout 时
+      # 路径超过 Win32 MAX_PATH(260)，需放开 git 的长路径限制
+      - name: Enable git long paths
+        shell: bash
+        run: git config --global core.longpaths true
+
       - name: Setup go
         uses: actions/setup-go@main
         with:
@@ -70,10 +76,20 @@ jobs:
         run: |
           flutter build windows --dart-define="UPDATE_CHANNEL=windowsPortable"
           $release = "build\windows\x64\runner\Release\"
-          $mingw = "C:\Program Files\Git\mingw64\bin"
-          cp $mingw\libstdc++-6.dll $release
-          cp $mingw\libgcc_s_seh-1.dll $release
-          cp $mingw\libwinpthread-1.dll $release
+          # libgopeed.dll 由镜像预装的 gcc(Strawberry Perl) 链接，运行时 DLL
+          # 应从同源目录取（新版 Git for Windows 已不再携带这些 DLL）
+          $mingwCandidates = @("C:\Strawberry\c\bin", "C:\Program Files\Git\mingw64\bin")
+          foreach ($dll in @("libstdc++-6.dll","libgcc_s_seh-1.dll","libwinpthread-1.dll")) {
+            $copied = $false
+            foreach ($dir in $mingwCandidates) {
+              if (Test-Path (Join-Path $dir $dll)) {
+                cp (Join-Path $dir $dll) $release
+                $copied = $true
+                break
+              }
+            }
+            if (-not $copied) { throw "$dll not found in any mingw location" }
+          }
           $system = "C:\Windows\System32"
           cp $system\msvcp140.dll $release
           cp $system\vcruntime140.dll $release

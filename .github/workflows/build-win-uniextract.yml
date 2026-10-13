@@ -31,16 +31,43 @@ jobs:
         shell: pwsh
         run: choco install autoit -y --no-progress
 
-      # Aut2Exe 命令行编译主程序；#AutoIt3Wrapper_Outfile 指令已声明输出为
-      # .\UniExtract.exe【turn3fetch0】。/comp 2 为最高压缩，x64 目标
+      # Aut2Exe 为 GUI 程序，失败时静默退出或弹不可见对话框，PowerShell 默认
+      # 不中断。用 Start-Process -Wait -NoNewWindow 强制等待并捕获退出码，
+      # stderr/stdout 重定向到文件后再输出——否则编译失败原因完全不可见
       - name: Compile main executable
         working-directory: uniextract_source
         shell: pwsh
         run: |
-          $aut2exe = "C:\Program Files (x86)\AutoIt3\Aut2Exe\aut2exe_x64.exe"
-          if (-not (Test-Path $aut2exe)) { $aut2exe = "C:\Program Files (x86)\AutoIt3\Aut2Exe\aut2exe.exe" }
-          & $aut2exe /in "UniExtract.au3" /out "UniExtract.exe" /comp 2 /x64
-          if (-not (Test-Path "UniExtract.exe")) { throw "Compile failed" }
+          $aut2exeCandidates = @(
+            "C:\Program Files (x86)\AutoIt3\Aut2Exe\Aut2Exe_x64.exe",
+            "C:\Program Files (x86)\AutoIt3\Aut2Exe\Aut2Exe.exe",
+            "C:\Program Files\AutoIt3\Aut2Exe\Aut2Exe_x64.exe",
+            "C:\Program Files\AutoIt3\Aut2Exe\Aut2Exe.exe"
+          )
+          $aut2exe = $aut2exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $aut2exe) {
+            Write-Host "=== No Aut2Exe found in candidates ==="
+            Get-ChildItem "C:\Program Files*\AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
+            throw "Aut2Exe not found anywhere under AutoIt3 install"
+          }
+          Write-Host "Using compiler: $aut2exe"
+
+          $stdout = "$env:TEMP\aut2exe_out.txt"
+          $stderr = "$env:TEMP\aut2exe_err.txt"
+          $proc = Start-Process -FilePath $aut2exe `
+            -ArgumentList '/in',"UniExtract.au3",'/out',"UniExtract.exe",'/comp','2','/x64','/nopack' `
+            -Wait -PassThru -NoNewWindow `
+            -RedirectStandardOutput $stdout -RedirectStandardError $stderr
+          Write-Host "=== Aut2Exe exit code: $($proc.ExitCode) ==="
+          Write-Host "=== stdout ==="
+          if (Test-Path $stdout) { Get-Content $stdout | ForEach-Object { Write-Host $_ } }
+          Write-Host "=== stderr ==="
+          if (Test-Path $stderr) { Get-Content $stderr | ForEach-Object { Write-Host $_ } }
+
+          if ($proc.ExitCode -ne 0 -or -not (Test-Path "UniExtract.exe")) {
+            throw "Aut2Exe failed (exit=$($proc.ExitCode))"
+          }
 
       # 官方更新服务器提供完整程序文件清单：每行 文件名,字节数,MD5
       # $sUrlUpdateStable = "https://update.bioruebe.com/uniextract/data/"【turn3fetch0】

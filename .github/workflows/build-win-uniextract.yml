@@ -27,32 +27,12 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
-      # === 依赖：AutoIt 本体（Aut2Exe）+ SciTE4AutoIt3（AutoIt3Wrapper）===
-      # choco autoit 包只含裸 Aut2Exe，不解析 #AutoIt3Wrapper_* 指令，
-      # 产物会缺图标和版本资源。AutoIt3Wrapper 负责注入
-      # uniextract_exe.ico、Description、Fileversion、Copyright、HiDPI manifest。
-      # SciTE4AutoIt3 优先用 portable zip（免安装器静默参数的不确定性），
-      # 失败则回退官方安装包 /S 静默安装
+      # choco scite4autoit3 包：2024-02 审核通过，安装脚本自带
+      # 官方直链 URL + sha256 校验 + NSIS /S 静默参数【turn0find0】
       - name: Install AutoIt and SciTE4AutoIt3
         shell: pwsh
         run: |
-          choco install autoit -y --no-progress
-
-          # 方案一：portable zip 免安装
-          $portableOk = $false
-          try {
-            $zip = "$env:TEMP\SciTE4AutoIt3_Portable.zip"
-            Invoke-WebRequest -Uri "https://www.autoitscript.com/site/wp-content/uploads/2021/03/SciTE4AutoIt3_Portable.zip" -OutFile $zip
-            Expand-Archive -Path $zip -DestinationPath "C:\SciTE4AutoIt3" -Force
-            if (Test-Path "C:\SciTE4AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe") { $portableOk = $true }
-          } catch { Write-Host "portable download failed: $_" }
-
-          # 方案二：安装包静默装（NSIS /S）
-          if (-not $portableOk) {
-            $sci = "$env:TEMP\scite4autoit3.exe"
-            Invoke-WebRequest -Uri "https://www.autoitscript.com/site/wp-content/uploads/2021/03/SciTE4AutoIt3.exe" -OutFile $sci
-            Start-Process -FilePath $sci -ArgumentList "/S" -Wait
-          }
+          choco install autoit scite4autoit3 -y --no-progress
 
       # === 编译主程序 ===
       # 通过 AutoIt3Wrapper 调用 Aut2Exe：解析源码指令后产物带

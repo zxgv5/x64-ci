@@ -26,51 +26,50 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
-      # 源码为 AutoIt 脚本，编译只需 Aut2Exe（随 AutoIt 主包安装）
-      - name: Install AutoIt
+      # SciTE4AutoIt3 提供 AutoIt3Wrapper（解析 #AutoIt3Wrapper_* 指令，
+      # 注入图标/版本资源），choco 的 autoit 包只有裸 Aut2Exe 不含它。
+      # 官网提供安装版与 SciTE4AutoIt3_Portable.zip【turn1fetch0】，取安装版静默装
+      - name: Install AutoIt and SciTE4AutoIt3
         shell: pwsh
-        run: choco install autoit -y --no-progress
+        run: |
+          choco install autoit -y --no-progress
+          # SciTE4AutoIt3 安装包支持 /S 静默（NSIS 标准）
+          $url = "https://www.autoitscript.com/site/autoit-script-editor/downloads/"
+          # 官方直链形如 https://www.autoitscript.com/cgi-bin/getfile.pl?....exe，
+          # 版本会滚动；下载页取当前直链（2021-3-16 版，5439KB）【turn1fetch0】
+          $sci = "$env:TEMP\scite4autoit3.exe"
+          Invoke-WebRequest -Uri "https://www.autoitscript.com/site/wp-content/uploads/2021/03/SciTE4AutoIt3.exe" -OutFile $sci
+          Start-Process -FilePath $sci -ArgumentList "/S" -Wait
 
-      # Aut2Exe 为 GUI 程序，失败时静默退出或弹不可见对话框，PowerShell 默认
-      # 不中断。用 Start-Process -Wait -NoNewWindow 强制等待并捕获退出码，
-      # stderr/stdout 重定向到文件后再输出——否则编译失败原因完全不可见
+      # AutoIt3Wrapper 解析源码指令后调用 Aut2Exe：产物带 uniextract_exe.ico
+      # 图标、Description/Fileversion/Copyright 版本资源、HiDpi manifest
       - name: Compile main executable
         working-directory: uniextract_source
         shell: pwsh
         run: |
-          $aut2exeCandidates = @(
-            "C:\Program Files (x86)\AutoIt3\Aut2Exe\Aut2Exe_x64.exe",
-            "C:\Program Files (x86)\AutoIt3\Aut2Exe\Aut2Exe.exe",
-            "C:\Program Files\AutoIt3\Aut2Exe\Aut2Exe_x64.exe",
-            "C:\Program Files\AutoIt3\Aut2Exe\Aut2Exe.exe"
+          $wrapperCandidates = @(
+            "C:\Program Files (x86)\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe",
+            "C:\Program Files\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe"
           )
-          $aut2exe = $aut2exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $aut2exe) {
-            Write-Host "=== No Aut2Exe found in candidates ==="
-            Get-ChildItem "C:\Program Files*\AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "  $($_.FullName)" }
-            throw "Aut2Exe not found anywhere under AutoIt3 install"
-          }
-          Write-Host "Using compiler: $aut2exe"
+          $wrapper = $wrapperCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $wrapper) { throw "AutoIt3Wrapper not found" }
+          Write-Host "Using wrapper: $wrapper"
 
-          $stdout = "$env:TEMP\aut2exe_out.txt"
-          $stderr = "$env:TEMP\aut2exe_err.txt"
-          $proc = Start-Process -FilePath $aut2exe `
-            -ArgumentList '/in',"UniExtract.au3",'/out',"UniExtract.exe",'/comp','2','/x64','/nopack' `
+          $stdout = "$env:TEMP\wrapper_out.txt"
+          $stderr = "$env:TEMP\wrapper_err.txt"
+          # /in 指定脚本；指令区已声明 Outfile=.\UniExtract.exe，无需再传 /out
+          $proc = Start-Process -FilePath $wrapper `
+            -ArgumentList '/in',"UniExtract.au3",'/prod','/NoPrompt' `
+            -WorkingDirectory (Get-Location) `
             -Wait -PassThru -NoNewWindow `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-          Write-Host "=== Aut2Exe exit code: $($proc.ExitCode) ==="
-          Write-Host "=== stdout ==="
-          if (Test-Path $stdout) { Get-Content $stdout | ForEach-Object { Write-Host $_ } }
-          Write-Host "=== stderr ==="
-          if (Test-Path $stderr) { Get-Content $stderr | ForEach-Object { Write-Host $_ } }
-
+          Write-Host "=== exit code: $($proc.ExitCode) ==="
+          Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
           if ($proc.ExitCode -ne 0 -or -not (Test-Path "UniExtract.exe")) {
-            throw "Aut2Exe failed (exit=$($proc.ExitCode))"
+            throw "AutoIt3Wrapper failed (exit=$($proc.ExitCode))"
           }
-
-      # 官方更新服务器提供完整程序文件清单：每行 文件名,字节数,MD5
-      # $sUrlUpdateStable = "https://update.bioruebe.com/uniextract/data/"【turn3fetch0】
+ 
       - name: Download program files from official update server
         working-directory: uniextract_source
         shell: pwsh

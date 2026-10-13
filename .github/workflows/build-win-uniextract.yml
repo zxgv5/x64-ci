@@ -1,0 +1,95 @@
+name: build-win-uniextract
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions: write-all
+    steps:
+      - name: Checkout source repo
+        uses: actions/checkout@main
+        with:
+          repository: Bioruebe/UniExtract2
+          ref: master
+          path: uniextract_source
+          fetch-depth: 0
+
+      - name: Checkout ci source repo
+        uses: actions/checkout@main
+        with:
+          path: ci_source
+
+      - name: Generate timestamp
+        shell: bash
+        run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+
+      # 源码为 AutoIt 脚本，编译只需 Aut2Exe（随 AutoIt 主包安装）
+      - name: Install AutoIt
+        shell: pwsh
+        run: choco install autoit -y --no-progress
+
+      # Aut2Exe 命令行编译主程序；#AutoIt3Wrapper_Outfile 指令已声明输出为
+      # .\UniExtract.exe【turn3fetch0】。/comp 2 为最高压缩，x64 目标
+      - name: Compile main executable
+        working-directory: uniextract_source
+        shell: pwsh
+        run: |
+          $aut2exe = "C:\Program Files (x86)\AutoIt3\Aut2Exe\aut2exe_x64.exe"
+          if (-not (Test-Path $aut2exe)) { $aut2exe = "C:\Program Files (x86)\AutoIt3\Aut2Exe\aut2exe.exe" }
+          & $aut2exe /in "UniExtract.au3" /out "UniExtract.exe" /comp 2 /x64
+          if (-not (Test-Path "UniExtract.exe")) { throw "Compile failed" }
+
+      # 官方更新服务器提供完整程序文件清单：每行 文件名,字节数,MD5
+      # $sUrlUpdateStable = "https://update.bioruebe.com/uniextract/data/"【turn3fetch0】
+      - name: Download program files from official update server
+        working-directory: uniextract_source
+        shell: pwsh
+        run: |
+          $base = "https://update.bioruebe.com/uniextract/data/"
+          $index = (Invoke-WebRequest -Uri ($base + "index") -UseBasicParsing).Content -split "`n" | Where-Object { $_.Trim() }
+          foreach ($line in $index) {
+            $parts = $line.Split(",")
+            if ($parts.Count -lt 3) { continue }
+            $file = $parts[0].Trim()
+            # 清单中目录以 / 结尾，需递归取子目录 index
+            if ($file.EndsWith("/")) {
+              $sub = (Invoke-WebRequest -Uri ($base + $file + "index") -UseBasicParsing).Content -split "`n" | Where-Object { $_.Trim() }
+              foreach ($sline in $sub) {
+                $sparts = $sline.Split(",")
+                if ($sparts.Count -lt 3) { continue }
+                $sfile = $sparts[0].Trim()
+                if ($sfile.EndsWith("/")) { continue }
+                $dest = Join-Path "." $file$sfile
+                New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+                Invoke-WebRequest -Uri ($base + $file + $sfile) -OutFile $dest -UseBasicParsing
+              }
+            } else {
+              $dest = Join-Path "." $file
+              New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
+              Invoke-WebRequest -Uri ($base + $file) -OutFile $dest -UseBasicParsing
+            }
+          }
+          Write-Host "Downloaded $($index.Count) index entries"
+
+      - name: Rename and move
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="${{ github.workspace }}/dist/uniextract-${{ env.BUILD_DATE }}"
+          mkdir -p "$DEST"
+          # 整目录拷贝（主程序 + bin/ + lang/ + def/ + docs/ + support/）
+          cp -r uniextract_source/* "$DEST/"
+          rm -rf "$DEST/.git"
+          find "$DEST" -maxdepth 1 | sort
+
+      # === Release（产物未签名，仅私用，勿公开 release）===
+      - name: Encrypt package and create release
+        uses: ./ci_source/.github/actions/aes256pac_release/
+        with:
+          ZIP_AES256_PWD: ${{ secrets.ZIP_AES256_PWD }}
+          ZIP_COMPRESS_LEVEL: '9'
+          BUILD_ARTIFACT_PATH: "./dist/uniextract-${{ env.BUILD_DATE }}"
+          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-uniextract"

@@ -9,10 +9,11 @@ jobs:
     runs-on: windows-latest
     permissions: write-all
     steps:
+      # === 源码：gvp9000 fork（活跃主线，2026-10 仍在发版）===
       - name: Checkout source repo
         uses: actions/checkout@main
         with:
-          repository: Bioruebe/UniExtract2
+          repository: gvp9000/UniExtract2
           ref: master
           path: uniextract_source
           fetch-depth: 0
@@ -26,61 +27,105 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
-      # SciTE4AutoIt3 提供 AutoIt3Wrapper（解析 #AutoIt3Wrapper_* 指令，
-      # 注入图标/版本资源），choco 的 autoit 包只有裸 Aut2Exe 不含它。
-      # 官网提供安装版与 SciTE4AutoIt3_Portable.zip【turn1fetch0】，取安装版静默装
+      # === 依赖：AutoIt 本体（Aut2Exe）+ SciTE4AutoIt3（AutoIt3Wrapper）===
+      # choco autoit 包只含裸 Aut2Exe，不解析 #AutoIt3Wrapper_* 指令，
+      # 产物会缺图标和版本资源。AutoIt3Wrapper 负责注入
+      # uniextract_exe.ico、Description、Fileversion、Copyright、HiDPI manifest。
+      # SciTE4AutoIt3 优先用 portable zip（免安装器静默参数的不确定性），
+      # 失败则回退官方安装包 /S 静默安装
       - name: Install AutoIt and SciTE4AutoIt3
         shell: pwsh
         run: |
           choco install autoit -y --no-progress
-          # SciTE4AutoIt3 安装包支持 /S 静默（NSIS 标准）
-          $url = "https://www.autoitscript.com/site/autoit-script-editor/downloads/"
-          # 官方直链形如 https://www.autoitscript.com/cgi-bin/getfile.pl?....exe，
-          # 版本会滚动；下载页取当前直链（2021-3-16 版，5439KB）【turn1fetch0】
-          $sci = "$env:TEMP\scite4autoit3.exe"
-          Invoke-WebRequest -Uri "https://www.autoitscript.com/site/wp-content/uploads/2021/03/SciTE4AutoIt3.exe" -OutFile $sci
-          Start-Process -FilePath $sci -ArgumentList "/S" -Wait
 
-      # AutoIt3Wrapper 解析源码指令后调用 Aut2Exe：产物带 uniextract_exe.ico
-      # 图标、Description/Fileversion/Copyright 版本资源、HiDpi manifest
+          # 方案一：portable zip 免安装
+          $portableOk = $false
+          try {
+            $zip = "$env:TEMP\SciTE4AutoIt3_Portable.zip"
+            Invoke-WebRequest -Uri "https://www.autoitscript.com/site/wp-content/uploads/2021/03/SciTE4AutoIt3_Portable.zip" -OutFile $zip
+            Expand-Archive -Path $zip -DestinationPath "C:\SciTE4AutoIt3" -Force
+            if (Test-Path "C:\SciTE4AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe") { $portableOk = $true }
+          } catch { Write-Host "portable download failed: $_" }
+
+          # 方案二：安装包静默装（NSIS /S）
+          if (-not $portableOk) {
+            $sci = "$env:TEMP\scite4autoit3.exe"
+            Invoke-WebRequest -Uri "https://www.autoitscript.com/site/wp-content/uploads/2021/03/SciTE4AutoIt3.exe" -OutFile $sci
+            Start-Process -FilePath $sci -ArgumentList "/S" -Wait
+          }
+
+      # === 编译主程序 ===
+      # 通过 AutoIt3Wrapper 调用 Aut2Exe：解析源码指令后产物带
+      # 图标/版本资源。Start-Process -Wait 强制等待并捕获退出码，
+      # stdout/stderr 重定向到文件后再输出——绕开 pwsh 包装层吞输出的问题
       - name: Compile main executable
         working-directory: uniextract_source
         shell: pwsh
         run: |
           $wrapperCandidates = @(
+            "C:\SciTE4AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe",
             "C:\Program Files (x86)\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe",
             "C:\Program Files\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe"
           )
           $wrapper = $wrapperCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $wrapper) { throw "AutoIt3Wrapper not found" }
+          if (-not $wrapper) {
+            Write-Host "=== AutoIt3Wrapper not found in candidates ==="
+            Get-ChildItem "C:\Program Files*\AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
+            Get-ChildItem "C:\SciTE4AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
+            throw "AutoIt3Wrapper not found"
+          }
           Write-Host "Using wrapper: $wrapper"
 
           $stdout = "$env:TEMP\wrapper_out.txt"
           $stderr = "$env:TEMP\wrapper_err.txt"
-          # /in 指定脚本；指令区已声明 Outfile=.\UniExtract.exe，无需再传 /out
+          # /in 指定脚本；指令区已声明 Outfile=.\UniExtract.exe
           $proc = Start-Process -FilePath $wrapper `
             -ArgumentList '/in',"UniExtract.au3",'/prod','/NoPrompt' `
             -WorkingDirectory (Get-Location) `
             -Wait -PassThru -NoNewWindow `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-          Write-Host "=== exit code: $($proc.ExitCode) ==="
+          Write-Host "=== AutoIt3Wrapper exit code: $($proc.ExitCode) ==="
+          Write-Host "=== stdout ==="
           Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+          Write-Host "=== stderr ==="
           Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
+
           if ($proc.ExitCode -ne 0 -or -not (Test-Path "UniExtract.exe")) {
             throw "AutoIt3Wrapper failed (exit=$($proc.ExitCode))"
           }
- 
+
+      # === 验证资源注入 ===
+      # 快速确认图标与版本信息已进产物，否则说明 Wrapper 没接管编译
+      - name: Verify resources
+        working-directory: uniextract_source
+        shell: pwsh
+        run: |
+          $ver = (Get-Item "UniExtract.exe").VersionInfo
+          Write-Host "Description: $($ver.FileDescription)"
+          Write-Host "FileVersion:  $($ver.FileVersion)"
+          Write-Host "Copyright:   $($ver.LegalCopyright)"
+          if ([string]::IsNullOrWhiteSpace($ver.FileDescription)) {
+            Write-Host "WARNING: FileDescription empty - wrapper may not have processed directives"
+          }
+
+      # === helper binaries：从官方更新服务器补齐 ===
+      # bin/ 下几十个第三方提取器不在源码仓库中，由更新服务器统一维护。
+      # 清单协议：每行 文件名,字节数,MD5；目录条目以 / 结尾，递归取子目录 index。
+      # 注意：若 gvp9000 v3.0.6 的 helper 版本与此服务器不一致（如 DiE 签名日期
+      # 对不上 2026-06-14），需到 gvp9000 的 GitHub Pages 找其自有更新清单替换 $base
       - name: Download program files from official update server
         working-directory: uniextract_source
         shell: pwsh
         run: |
           $base = "https://update.bioruebe.com/uniextract/data/"
           $index = (Invoke-WebRequest -Uri ($base + "index") -UseBasicParsing).Content -split "`n" | Where-Object { $_.Trim() }
+          $count = 0
           foreach ($line in $index) {
             $parts = $line.Split(",")
             if ($parts.Count -lt 3) { continue }
             $file = $parts[0].Trim()
-            # 清单中目录以 / 结尾，需递归取子目录 index
             if ($file.EndsWith("/")) {
               $sub = (Invoke-WebRequest -Uri ($base + $file + "index") -UseBasicParsing).Content -split "`n" | Where-Object { $_.Trim() }
               foreach ($sline in $sub) {
@@ -91,14 +136,18 @@ jobs:
                 $dest = Join-Path "." $file$sfile
                 New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
                 Invoke-WebRequest -Uri ($base + $file + $sfile) -OutFile $dest -UseBasicParsing
+                $count++
               }
             } else {
               $dest = Join-Path "." $file
               New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
               Invoke-WebRequest -Uri ($base + $file) -OutFile $dest -UseBasicParsing
+              $count++
             }
           }
-          Write-Host "Downloaded $($index.Count) index entries"
+          Write-Host "Downloaded $count files"
+          Get-ChildItem ".\bin" -ErrorAction SilentlyContinue |
+            Select-Object -First 20 | ForEach-Object { Write-Host "  bin/$($_.Name)" }
 
       - name: Rename and move
         shell: bash
@@ -106,12 +155,12 @@ jobs:
           set -euo pipefail
           DEST="${{ github.workspace }}/dist/uniextract-${{ env.BUILD_DATE }}"
           mkdir -p "$DEST"
-          # 整目录拷贝（主程序 + bin/ + lang/ + def/ + docs/ + support/）
           cp -r uniextract_source/* "$DEST/"
           rm -rf "$DEST/.git"
           find "$DEST" -maxdepth 1 | sort
 
-      # === Release（产物未签名，仅私用，勿公开 release）===
+      # === Release（产物含第三方提取器，禁商用/禁再分发条款，
+      # 仅私用，勿公开 release）===
       - name: Encrypt package and create release
         uses: ./ci_source/.github/actions/aes256pac_release/
         with:

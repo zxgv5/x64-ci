@@ -1,0 +1,151 @@
+name: build-win-npp
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions: write-all
+    steps:
+      # === 源码：notepad-plus-plus master（活跃主线，2026-10 仍在发版）===
+      # 仓库无 submodule（官方 CI 的 checkout 均未配 submodules 键），
+      # Boost 1.90.0 裁剪版直接内嵌在 boostregex/boost 目录，无外部依赖
+      - name: Checkout source repo
+        uses: actions/checkout@main
+        with:
+          repository: notepad-plus-plus/notepad-plus-plus
+          ref: master
+          path: npp_source
+          fetch-depth: 0
+
+      - name: Checkout ci source repo
+        uses: actions/checkout@main
+        with:
+          path: ci_source
+
+      - name: Generate timestamp
+        shell: bash
+        run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+
+      # === MSBuild（windows-latest 自带 VS2022 v143，满足 BUILD.md
+      # 的 VS 2022 17.5+ 要求；此步仅把 msbuild 加入 PATH）===
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@v3
+
+      # === 构建 x64 Release ===
+      # 与官方 CI_build.yml 完全一致的命令：msbuild notepadPlus.sln
+      # /m /p:configuration=Release /p:platform=x64
+      # 输出：PowerEditor\bin64\Notepad++.exe（appveyor 与官方 CI 的
+      # x64/Release artifact 路径均为 bin64）
+      - name: Build x64 Release
+        working-directory: npp_source/PowerEditor/visual.net
+        shell: pwsh
+        run: |
+          msbuild notepadPlus.sln /m /p:configuration=Release /p:platform=x64
+          if ($LASTEXITCODE -ne 0) { throw "msbuild failed with $LASTEXITCODE" }
+
+          $exe = "..\bin64\Notepad++.exe"
+          if (-not (Test-Path $exe)) { throw "Notepad++.exe not produced at $exe" }
+          $size = (Get-Item $exe).Length
+          Write-Host "=== Notepad++.exe: $([math]::Round($size/1MB,2)) MB ==="
+
+          # 硬失败判定：x64 PE 标志 + 版本信息非空，杜绝空壳产物
+          $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
+          $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
+          $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
+          if ($machine -ne 0x8664) { throw ("not x64 PE (Machine=0x{0:X4})" -f $machine) }
+          Write-Host "x64 PE verified OK"
+          $ver = (Get-Item (Resolve-Path $exe)).VersionInfo
+          Write-Host "FileVersion: $($ver.FileVersion)"
+          if ([string]::IsNullOrWhiteSpace($ver.FileVersion)) {
+            throw "empty version info - build may be broken"
+          }
+
+      # === 组装 portable 包 ===
+      # 官方 portable zip 的结构 = Notepad++.exe + 模型配置 + 语言包 +
+      # functionList + autoCompletion(APIs) + themes，全部素材在仓库内：
+      #   langs/stylers.model.xml        ← PowerEditor/src/
+      #   nativeLang/*.xml               ← PowerEditor/installer/nativeLang/
+      #   functionList/                  ← PowerEditor/installer/functionList/
+      #   APIs/*.xml (autoCompletion)    ← PowerEditor/installer/APIs/
+      #   themes/                        ← PowerEditor/installer/themes/
+      #   contextMenu/shortcuts 模型     ← PowerEditor/installer/
+      # portable 模式由根下 doLocalConf.xml 触发（配置写本地而非 %APPDATA%）
+      - name: Assemble portable package
+        working-directory: npp_source/PowerEditor
+        shell: pwsh
+        run: |
+          $pkg = "portable"
+          New-Item -ItemType Directory -Path $pkg -Force | Out-Null
+
+          Copy-Item "bin64\Notepad++.exe" "$pkg\Notepad++.exe"
+
+          # 模型配置（首次启动时 NPP 自动实例化为 langs.xml 等）
+          $modelFiles = @(
+            "src\langs.model.xml", "src\stylers.model.xml",
+            "installer\config.model.xml", "installer\contextMenu.model.xml",
+            "installer\shortcuts.model.xml"
+          )
+          foreach ($f in $modelFiles) {
+            if (Test-Path $f) { Copy-Item $f "$pkg\" ; Write-Host "  + $f" }
+            else { Write-Host "  - skip (not in this version): $f" }
+          }
+
+          # 目录素材：nativeLang → localization（官方 portable 命名）
+          Copy-Item "installer\nativeLang" "$pkg\localization" -Recurse -Force
+          foreach ($d in @("functionList", "APIs", "themes")) {
+            if (Test-Path "installer\$d") { Copy-Item "installer\$d" "$pkg\$d" -Recurse -Force }
+          }
+          # autoCompletion 官方包命名：APIs 目录内容进 autoCompletion/
+          if (Test-Path "$pkg\APIs") {
+            New-Item -ItemType Directory -Path "$pkg\autoCompletion" -Force | Out-Null
+            Copy-Item "$pkg\APIs\*" "$pkg\autoCompletion\" -Recurse -Force
+            Remove-Item "$pkg\APIs" -Recurse -Force
+          }
+
+          # license / readme
+          foreach ($f in @("..\LICENSE", "..\README.md")) {
+            if (Test-Path $f) { Copy-Item $f "$pkg\" }
+          }
+
+          # portable 标志文件：配置持久化到本地目录而非 %APPDATA%
+          New-Item -ItemType File -Path "$pkg\doLocalConf.xml" -Force | Out-Null
+
+          # 硬失败判定
+          $files = Get-ChildItem $pkg -Recurse -File
+          $total = ($files | Measure-Object Length -Sum).Sum
+          Write-Host "=== portable package: $($files.Count) files, $([math]::Round($total/1MB,1)) MB ==="
+          foreach ($req in @("Notepad++.exe", "doLocalConf.xml", "langs.model.xml", "stylers.model.xml")) {
+            if (-not (Test-Path "$pkg\$req")) { throw "portable missing: $req" }
+          }
+          if ((Get-ChildItem "$pkg\localization" -File -ErrorAction SilentlyContinue).Count -lt 40) {
+            throw "localization folder incomplete - check nativeLang copy"
+          }
+          if ($total -lt 5MB) { throw "package too small - assembly incomplete" }
+          $pkgAbs = (Resolve-Path $pkg).Path -replace '\\', '/'
+          Write-Host "NPP_PKG=$pkgAbs"
+          "NPP_PKG=$pkgAbs" >> $env:GITHUB_ENV
+
+      - name: Rename and move
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="${{ github.workspace }}/dist/npp-${{ env.BUILD_DATE }}"
+          mkdir -p "$DEST"
+          cp -r "${{ env.NPP_PKG }}"/* "$DEST/"
+          echo "=== dist content ==="
+          du -sh "$DEST"
+          ls "$DEST"
+          test -f "$DEST/Notepad++.exe" && test -f "$DEST/doLocalConf.xml"
+
+      # === Release（Notepad++ 为 GPL，无需加密再分发，
+      # 但沿用加密通道保持与 uniextract/hdm/x64dbg 一致的私有发布方式）===
+      - name: Encrypt package and create release
+        uses: ./ci_source/.github/actions/aes256pac_release/
+        with:
+          ZIP_AES256_PWD: ${{ secrets.ZIP_AES256_PWD }}
+          ZIP_COMPRESS_LEVEL: '9'
+          BUILD_ARTIFACT_PATH: "./dist/npp-${{ env.BUILD_DATE }}"
+          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-npp"

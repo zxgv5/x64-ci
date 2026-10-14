@@ -116,44 +116,54 @@ jobs:
             Write-Host "WARNING: FileDescription empty - wrapper may not have processed directives"
           }
 
-      # === helper binaries：从官方更新服务器补齐 ===
-      # bin/ 下几十个第三方提取器不在源码仓库中，由更新服务器统一维护。
-      # 清单协议：每行 文件名,字节数,MD5；目录条目以 / 结尾，递归取子目录 index。
-      # 注意：若 gvp9000 v3.0.6 的 helper 版本与此服务器不一致（如 DiE 签名日期
-      # 对不上 2026-06-14），需到 gvp9000 的 GitHub Pages 找其自有更新清单替换 $base
-      - name: Download program files from official update server
+      # === helper binaries：主通道从 gvp9000 官方 Release 资产抽取 ===
+      # fork 的 Release zip 是其源码 + 锁定版本 helpers 的完整发布物，
+      # 版本自洽性最有保障。更新服务器（bioruebe）作为参照打印供诊断
+      - name: Download program files
         working-directory: uniextract_source
         shell: pwsh
         run: |
-          $base = "https://update.bioruebe.com/uniextract/data/"
-          $index = (Invoke-WebRequest -Uri ($base + "index") -UseBasicParsing).Content -split "`n" | Where-Object { $_.Trim() }
-          $count = 0
-          foreach ($line in $index) {
-            $parts = $line.Split(",")
-            if ($parts.Count -lt 3) { continue }
-            $file = $parts[0].Trim()
-            if ($file.EndsWith("/")) {
-              $sub = (Invoke-WebRequest -Uri ($base + $file + "index") -UseBasicParsing).Content -split "`n" | Where-Object { $_.Trim() }
-              foreach ($sline in $sub) {
-                $sparts = $sline.Split(",")
-                if ($sparts.Count -lt 3) { continue }
-                $sfile = $sparts[0].Trim()
-                if ($sfile.EndsWith("/")) { continue }
-                $dest = Join-Path "." $file$sfile
-                New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
-                Invoke-WebRequest -Uri ($base + $file + $sfile) -OutFile $dest -UseBasicParsing
-                $count++
-              }
-            } else {
-              $dest = Join-Path "." $file
-              New-Item -ItemType Directory -Force -Path (Split-Path $dest) | Out-Null
-              Invoke-WebRequest -Uri ($base + $file) -OutFile $dest -UseBasicParsing
-              $count++
+          # 诊断：源码里实际声明的更新服务器（供对照，不用于下载）
+          Write-Host "=== URL constants found in source ==="
+          Get-ChildItem -Recurse -Include *.au3,*.ini -File |
+            Select-String -Pattern 'https?://[^\s"''>]+' |
+            ForEach-Object { Write-Host "  $($_.Filename):$($_.LineNumber): $($_.Matches[0].Value)" }
+
+          # 主通道：GitHub Release 最新资产
+          $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/gvp9000/UniExtract2/releases/latest" `
+            -Headers @{ "User-Agent" = "ci" }
+          Write-Host "=== Release: $($rel.tag_name) ==="
+          $asset = $rel.assets | Where-Object { $_.name -match '\.zip$' } | Select-Object -First 1
+          if (-not $asset) { throw "No zip asset in latest release" }
+          Write-Host "Asset: $($asset.name) ($([math]::Round($asset.size/1MB,1)) MB)"
+
+          $relzip = "$env:TEMP\release.zip"
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile $relzip -UserAgent "ci"
+          $relx = "$env:TEMP\release_extract"
+          Expand-Archive -Path $relzip -DestinationPath $relx -Force
+
+          # Release zip 内可能是单层目录包裹，定位真正的根
+          $relRoot = Get-ChildItem $relx -Directory | Select-Object -First 1
+          if ($relRoot -and (Test-Path "$($relRoot.FullName)\UniExtract.au3")) { $relRoot = $relRoot.FullName }
+          else { $relRoot = $relx }
+          Write-Host "Release root: $relRoot"
+
+          # bin/ 及 Release 中其他内容并入工作区（不覆盖本地已编译的 UniExtract.exe）
+          foreach ($item in Get-ChildItem $relRoot) {
+            if ($item.Name -eq "UniExtract.exe") {
+              Write-Host "  skip release exe (keep freshly built): $($item.Name)"
+              continue
             }
+            Copy-Item $item.FullName -Destination . -Recurse -Force
+            Write-Host "  merged: $($item.Name)"
           }
-          Write-Host "Downloaded $count files"
+
+          # 硬失败判定：bin/ 下文件数必须像个样子
+          $binCount = (Get-ChildItem ".\bin" -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "=== bin/ file count: $binCount ==="
           Get-ChildItem ".\bin" -ErrorAction SilentlyContinue |
             Select-Object -First 20 | ForEach-Object { Write-Host "  bin/$($_.Name)" }
+          if ($binCount -lt 20) { throw "bin/ only has $binCount files - merge failed" }
 
       - name: Rename and move
         shell: bash

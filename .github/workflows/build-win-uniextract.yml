@@ -37,10 +37,13 @@ jobs:
           # 唯独缺 AutoIt3Wrapper（属 SciTE4AutoIt3 增量包）。
           # 从官方 portable zip 取该文件夹放进标准位置，补齐 Wrapper
           # 向上回溯推导 AutoIt3 根目录所需的目录层级
+          # 注：官网对非浏览器 UA 返回 403，必须带浏览器 UA 下载
           $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
           $zip = "$env:TEMP\SciTE4AutoIt3_Portable.zip"
           Invoke-WebRequest -Uri "https://www.autoitscript.com/autoit3/scite/download/SciTE4AutoIt3_Portable.zip" `
             -OutFile $zip -UserAgent $ua
+          # 校验用 .CompareTo()：-ne 运算符对 "9e41" 开头字符串会做
+          # 科学计数法类型转换，导致相同字符串判为不等
           $expected = "9e41b60753b566af3333601a9720607fbf71a248c2e7225b5ee1fec0ca852722"
           $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           if ($actual.CompareTo($expected) -ne 0) { throw "SHA256 mismatch: actual=[$actual]" }
@@ -76,8 +79,11 @@ jobs:
           $stdout = "$env:TEMP\wrapper_out.txt"
           $stderr = "$env:TEMP\wrapper_err.txt"
           $target = (Resolve-Path "UniExtract.au3").Path
-          # /AutoIt3Dir 显式指定 AutoIt3 根：优先级最高（命令行 > 指令区 >
-          # 相对路径推导），兜住层级推导的任何差异【turn1fetch0】【turn3fetch0】
+          # AutoIt3Wrapper 本体是 .au3 脚本，exe 只是其编译产物（杀软误报
+          # 重灾区）。用 AutoIt3.exe 解释运行 .au3 绕开 exe 获取链路；
+          # /NoStatus 抑制进度窗口；/AutoIt3Dir 显式指定 AutoIt3 根，
+          # 优先级最高，兜住 Wrapper 相对路径推导的任何层级差异；
+          # /prod 用生产版 AutoIt；/in 为绝对路径
           $proc = Start-Process -FilePath $autoit3 `
             -ArgumentList "`"$wrapperAu3`"", '/NoStatus', '/AutoIt3Dir', "`"$autoitRoot`"", '/prod', '/in', "`"$target`"" `
             -WorkingDirectory (Get-Location) `
@@ -90,6 +96,7 @@ jobs:
           Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
 
           # Wrapper 内部会启动 Aut2Exe 子进程，进程退出 ≠ 产物写完。轮询等待
+          # UniExtract.exe 出现且大小稳定
           $exe = Join-Path (Get-Location) "UniExtract.exe"
           $found = $false
           for ($i = 0; $i -lt 30; $i++) {
@@ -116,19 +123,14 @@ jobs:
             Write-Host "WARNING: FileDescription empty - wrapper may not have processed directives"
           }
 
-      # === helper binaries：主通道从 gvp9000 官方 Release 资产抽取 ===
-      # fork 的 Release zip 是其源码 + 锁定版本 helpers 的完整发布物，
-      # 版本自洽性最有保障。更新服务器（bioruebe）作为参照打印供诊断
+      # === helper binaries：从 gvp9000 官方 Release 资产合并 ===
+      # fork 的 Release zip 是其锁定版本 helpers 的完整发布物，版本自洽性
+      # 最有保障。fork 的更新服务器为 gvp9000.github.io（源码 L96 声明），
+      # 上游 bioruebe 服务器对其无效
       - name: Download program files
         working-directory: uniextract_source
         shell: pwsh
         run: |
-          # 诊断：源码里实际声明的更新服务器（供对照，不用于下载）
-          Write-Host "=== URL constants found in source ==="
-          Get-ChildItem -Recurse -Include *.au3,*.ini -File |
-            Select-String -Pattern 'https?://[^\s"''>]+' |
-            ForEach-Object { Write-Host "  $($_.Filename):$($_.LineNumber): $($_.Matches[0].Value)" }
-
           # 主通道：GitHub Release 最新资产
           $rel = Invoke-RestMethod -Uri "https://api.github.com/repos/gvp9000/UniExtract2/releases/latest" `
             -Headers @{ "User-Agent" = "ci" }
@@ -142,8 +144,8 @@ jobs:
           $relx = "$env:TEMP\release_extract"
           Expand-Archive -Path $relzip -DestinationPath $relx -Force
 
-          # 修复：不再用 UniExtract.au3 当锚点（Release 是纯二进制包，不含源码）。
-          # 改用结构判定：解压根下唯一目录且无散落文件 = 单层包裹
+          # Release 是纯二进制包（不含 .au3 源码），不能用源码文件当锚点。
+          # 结构判定：解压根下唯一目录且无散落文件 = 单层包裹
           $topDirs  = Get-ChildItem $relx -Directory
           $topFiles = Get-ChildItem $relx -File
           if ($topDirs.Count -eq 1 -and $topFiles.Count -eq 0) {
@@ -155,6 +157,28 @@ jobs:
           Write-Host "=== Release root content ==="
           Get-ChildItem $relRoot | ForEach-Object { Write-Host "  $($_.Name)" }
 
+          # === 合并：bin/ def/ docs/ lang/ log/ support/ 及散文件并入工作区，
+          # 跳过 Release 的 UniExtract.exe，保留本 CI 刚编译的产物 ===
+          foreach ($item in Get-ChildItem $relRoot) {
+            if ($item.Name -eq "UniExtract.exe") {
+              Write-Host "  skip release exe (keep freshly built): $($item.Name)"
+              continue
+            }
+            Copy-Item $item.FullName -Destination . -Recurse -Force
+            Write-Host "  merged: $($item.Name)"
+          }
+
+          # 硬失败判定：bin/ 下文件数必须达标，杜绝"绿色步骤 + 空产物"
+          $binCount = (Get-ChildItem ".\bin" -Recurse -File -ErrorAction SilentlyContinue).Count
+          Write-Host "=== bin/ file count: $binCount ==="
+          Get-ChildItem ".\bin" -ErrorAction SilentlyContinue |
+            Select-Object -First 20 | ForEach-Object { Write-Host "  bin/$($_.Name)" }
+          if ($binCount -lt 20) { throw "bin/ only has $binCount files - merge failed" }
+
+          # 总量交叉验证
+          $all = Get-ChildItem . -Recurse -File
+          Write-Host "=== workspace total: $($all.Count) files, $([math]::Round(($all | Measure-Object Length -Sum).Sum/1MB,1)) MB ==="
+
       - name: Rename and move
         shell: bash
         run: |
@@ -163,6 +187,8 @@ jobs:
           mkdir -p "$DEST"
           cp -r uniextract_source/* "$DEST/"
           rm -rf "$DEST/.git"
+          echo "=== dist content ==="
+          du -sh "$DEST"
           find "$DEST" -maxdepth 1 | sort
 
       # === Release（产物含第三方提取器，禁商用/禁再分发条款，

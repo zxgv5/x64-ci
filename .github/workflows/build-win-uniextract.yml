@@ -36,13 +36,20 @@ jobs:
           $zip = "$env:TEMP\SciTE4AutoIt3_Portable.zip"
           Invoke-WebRequest -Uri "https://www.autoitscript.com/autoit3/scite/download/SciTE4AutoIt3_Portable.zip" `
             -OutFile $zip -UserAgent $ua
-          $expected = "9e41b60753b566af3333601a9720607fbf71a248c2e7225ee1fec0ca852722"
+
+          # 修复：用 .CompareTo() 替代 -ne——绕开 PowerShell 运算符
+          # 对 "数字+e" 开头字符串的科学计数法类型转换陷阱
+          $expected = "9e41b60753b566af3333601a9720607fbf71a248c2e7225b5ee1fec0ca852722"
           $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          if ($actual -ne $expected) { throw "SHA256 mismatch: $actual" }
+          Write-Host "actual:   [$actual]"
+          Write-Host "expected: [$expected]"
+          if ($actual.CompareTo($expected) -ne 0) {
+            throw "SHA256 mismatch: actual=[$actual] expected=[$expected]"
+          }
+          Write-Host "SHA256 verified OK"
+
           Expand-Archive -Path $zip -DestinationPath "C:\SciTE4AutoIt3" -Force
 
-          # AutoIt3Wrapper 本体是 .au3 脚本（exe 只是其编译产物）。
-          # 上一轮诊断用 -Filter "*.exe" 把 .au3 全部隐藏了——先看 au3 在不在
           $dirs = @("C:\SciTE4AutoIt3", "C:\Program Files (x86)\AutoIt3")
           $wrapperAu3 = $null
           foreach ($root in $dirs) {
@@ -59,8 +66,6 @@ jobs:
             Write-Host "--- all files under C:\SciTE4AutoIt3 ---"
             Get-ChildItem "C:\SciTE4AutoIt3" -Recurse -File -ErrorAction SilentlyContinue |
               ForEach-Object { Write-Host "  $($_.FullName)" }
-            # 完整安装器（NSIS /S）：AutoIt3Wrapper.au3 必在其中；
-            # getfile.pl 是官方跳转入口（社区 CI 实测可用）【turn0fetch0】
             $sci = "$env:TEMP\SciTE4AutoIt3.exe"
             Invoke-WebRequest -Uri "https://www.autoitscript.com/cgi-bin/getfile.pl?../autoit3/scite/download/SciTE4AutoIt3.exe" `
               -OutFile $sci -UserAgent $ua
@@ -72,7 +77,7 @@ jobs:
             Write-Host "AutoIt3Wrapper.au3 found: $wrapperAu3"
           }
           "WRAPPER_AU3=$wrapperAu3" >> $env:GITHUB_ENV
-
+ 
       - name: Compile main executable
         working-directory: uniextract_source
         shell: pwsh

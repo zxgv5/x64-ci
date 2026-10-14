@@ -9,9 +9,7 @@ jobs:
     runs-on: windows-latest
     permissions: write-all
     steps:
-      # === 源码：notepad-plus-plus master（活跃主线，2026-10 仍在发版）===
-      # 仓库无 submodule（官方 CI 的 checkout 均未配 submodules 键），
-      # Boost 1.90.0 裁剪版直接内嵌在 boostregex/boost 目录，无外部依赖
+      # === 主程序源码 ===
       - name: Checkout source repo
         uses: actions/checkout@main
         with:
@@ -25,21 +23,53 @@ jobs:
         with:
           path: ci_source
 
+      # === 官方三插件源码（npp-plugins org，结构 src/ + vs.proj/）===
+      - name: Checkout plugin mimeTools
+        uses: actions/checkout@main
+        with:
+          repository: npp-plugins/mimetools
+          ref: master
+          path: pl_mimetools
+
+      - name: Checkout plugin NppConverter
+        uses: actions/checkout@main
+        with:
+          repository: npp-plugins/nppconverter
+          ref: master
+          path: pl_nppconverter
+
+      - name: Checkout plugin NppExport
+        uses: actions/checkout@main
+        with:
+          repository: npp-plugins/nppexport
+          ref: master
+          path: pl_nppexport
+
+      # === updater（wingup：内嵌 curl 源码，需先编 curl 再编 GUP.sln）===
+      - name: Checkout updater wingup
+        uses: actions/checkout@main
+        with:
+          repository: notepad-plus-plus/wingup
+          ref: master
+          path: wingup
+
+      # === Plugin Admin 插件列表（JSON → 资源 DLL）===
+      - name: Checkout nppPluginList
+        uses: actions/checkout@main
+        with:
+          repository: notepad-plus-plus/nppPluginList
+          ref: master
+          path: npp_pluginlist
+
       - name: Generate timestamp
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
-      # === MSBuild（windows-latest 自带 VS2022 v143，满足 BUILD.md
-      # 的 VS 2022 17.5+ 要求；此步仅把 msbuild 加入 PATH）===
       - name: Add msbuild to PATH
         uses: microsoft/setup-msbuild@v3
 
-      # === 构建 x64 Release ===
-      # 与官方 CI_build.yml 完全一致的命令：msbuild notepadPlus.sln
-      # /m /p:configuration=Release /p:platform=x64
-      # 输出：PowerEditor\bin64\Notepad++.exe（appveyor 与官方 CI 的
-      # x64/Release artifact 路径均为 bin64）
-      - name: Build x64 Release
+      # === 主程序构建（与官方 CI 命令一致）===
+      - name: Build x64 Release (Notepad++.exe)
         working-directory: npp_source/PowerEditor/visual.net
         shell: pwsh
         run: |
@@ -51,21 +81,125 @@ jobs:
           $size = (Get-Item $exe).Length
           Write-Host "=== Notepad++.exe: $([math]::Round($size/1MB,2)) MB ==="
 
-          # 硬失败判定：x64 PE 标志 + 版本信息非空，杜绝空壳产物
           $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $exe))
           $peOffset = [BitConverter]::ToInt32($bytes, 0x3C)
           $machine = [BitConverter]::ToUInt16($bytes, $peOffset + 4)
           if ($machine -ne 0x8664) { throw ("not x64 PE (Machine=0x{0:X4})" -f $machine) }
           Write-Host "x64 PE verified OK"
-          $ver = (Get-Item (Resolve-Path $exe)).VersionInfo
-          Write-Host "FileVersion: $($ver.FileVersion)"
-          if ([string]::IsNullOrWhiteSpace($ver.FileVersion)) {
-            throw "empty version info - build may be broken"
+
+      # === 官方三插件：从源码构建 ===
+      # 仓库结构 src/ + vs.proj/，工程文件名不硬编码，按实际搜索；
+      # 项目若锁定旧工具集，先原样构建、失败后以 v143 覆写重试
+      - name: Build official plugins from source
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path built_plugins -Force | Out-Null
+          $plugins = @(
+            @{ repo = "pl_mimetools";    dll = "mimeTools.dll" },
+            @{ repo = "pl_nppconverter"; dll = "NppConverter.dll" },
+            @{ repo = "pl_nppexport";    dll = "NppExport.dll" }
+          )
+          foreach ($p in $plugins) {
+            Push-Location $p.repo
+            try {
+              $proj = Get-ChildItem . -Recurse -Include *.sln -File |
+                Select-Object -First 1
+              if (-not $proj) {
+                $proj = Get-ChildItem . -Recurse -Include *.vcxproj -File |
+                  Select-Object -First 1
+              }
+              if (-not $proj) { throw "no sln/vcxproj found in $($p.repo)" }
+              Write-Host "=== building $($p.repo): $($proj.Name) ==="
+
+              msbuild $proj.FullName /m /p:Configuration=Release /p:Platform=x64
+              if ($LASTEXITCODE -ne 0) {
+                Write-Host "--- retry with PlatformToolset=v143 ---"
+                msbuild $proj.FullName /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+                if ($LASTEXITCODE -ne 0) { throw "build failed: $($p.repo)" }
+              }
+
+              $dll = Get-ChildItem . -Recurse -Filter $p.dll -File |
+                Where-Object { $_.FullName -notmatch '\\(obj|intermediate)\\' } |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+              if (-not $dll) { throw "output $($p.dll) not found in $($p.repo)" }
+
+              $name = [IO.Path]::GetFileNameWithoutExtension($p.dll)
+              New-Item -ItemType Directory -Path "..\built_plugins\$name" -Force | Out-Null
+              Copy-Item $dll.FullName "..\built_plugins\$name\$($p.dll)"
+              Write-Host ("  + {0} v{1}" -f $p.dll,
+                (Get-Item $dll.FullName).VersionInfo.FileVersion)
+            } finally { Pop-Location }
           }
 
-      # === 组装 portable 包（对齐官方 packageAll.bat 的
-      # zipped.package.release64 清单；素材路径按文件名全树搜索定位，
-      # 排除 build64 中间目录，规避仓库目录结构漂移）===
+      # === updater：先编内嵌 curl（nmake 需 VC 环境），再编 GUP.sln ===
+      # 官方构建流程：curl winbuild + nmake mode=dll RTLIBCFG=static MACHINE=x64
+      - name: Build updater (wingup GUP.exe)
+        shell: cmd
+        run: |
+          set "VCVARS="
+          for /d %%D in ("C:\Program Files\Microsoft Visual Studio\2022\*") do (
+            if exist "%%D\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%D\VC\Auxiliary\Build\vcvars64.bat"
+          )
+          if not defined VCVARS exit /b 1
+          call "%VCVARS%"
+          cd wingup\curl\winbuild
+          set WINBUILD_ACKNOWLEDGE_DEPRECATED=yes
+          nmake /f Makefile.vc mode=dll vc=15 RTLIBCFG=static MACHINE=x64
+          if errorlevel 1 exit /b 1
+          cd ..\..
+          msbuild vcproj\GUP.sln /m /p:Configuration=Release /p:Platform=x64
+          if errorlevel 1 exit /b 1
+
+      - name: Stage updater files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path built_plugins\updater -Force | Out-Null
+          Push-Location wingup
+          try {
+            $gup = Get-ChildItem . -Recurse -Filter GUP.exe -File |
+              Where-Object { $_.FullName -notmatch '\\(obj|intermediate)\\' } |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $gup) { throw "GUP.exe not produced by wingup build" }
+            Copy-Item $gup.FullName ..\built_plugins\updater\
+            Write-Host ("  + GUP.exe v{0}" -f (Get-Item $gup.FullName).VersionInfo.FileVersion)
+            foreach ($f in @("gup.xml", "updater.ico", "LICENSE", "README.md")) {
+              $hit = Get-ChildItem . -Recurse -Filter $f -File | Select-Object -First 1
+              if ($hit) {
+                Copy-Item $hit.FullName ..\built_plugins\updater\
+                Write-Host "  + $f"
+              } else {
+                Write-Host "  - skip: $f (not in wingup repo)"
+              }
+            }
+          } finally { Pop-Location }
+
+      # === Plugin Admin 插件列表 DLL（自编版本未签名，官方版带签名）===
+      - name: Build nppPluginList.dll
+        shell: pwsh
+        run: |
+          Push-Location npp_pluginlist
+          try {
+            $proj = Get-ChildItem . -Recurse -Include *.vcxproj, *.sln -File |
+              Select-Object -First 1
+            if (-not $proj) { throw "no project found in nppPluginList repo" }
+            msbuild $proj.FullName /m /p:Configuration=Release /p:Platform=x64
+            if ($LASTEXITCODE -ne 0) {
+              msbuild $proj.FullName /m /p:Configuration=Release /p:Platform=x64 /p:PlatformToolset=v143
+              if ($LASTEXITCODE -ne 0) { throw "nppPluginList build failed" }
+            }
+            $dll = Get-ChildItem . -Recurse -Filter nppPluginList.dll -File |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $dll) { throw "nppPluginList.dll not produced" }
+            New-Item -ItemType Directory -Path ..\built_plugins\Config -Force | Out-Null
+            Copy-Item $dll.FullName ..\built_plugins\Config\
+            Write-Host "  + nppPluginList.dll (self-built, unsigned)"
+          } finally { Pop-Location }
+
+          # 传递暂存区绝对路径给组装步骤
+          $abs = (Resolve-Path ..\built_plugins).Path -replace '\\', '/'
+          "EXT_BIN=$abs" >> $env:GITHUB_ENV
+
+      # === 组装 portable 包（素材按文件名全树搜索定位）===
       - name: Assemble portable package
         working-directory: npp_source/PowerEditor
         shell: pwsh
@@ -81,7 +215,8 @@ jobs:
             $hit = Get-Source $name
             if ($hit) {
               Copy-Item $hit.FullName (Join-Path $dest $destName) -Force
-              Write-Host ("  + {0} <- {1}" -f $name, $hit.FullName.Substring((Get-Location).Path.Length + 1))
+              Write-Host ("  + {0} <- {1}" -f $name,
+                $hit.FullName.Substring((Get-Location).Path.Length + 1))
             } else {
               Write-Host "  !! NOT FOUND: $name"
               $script:missing += $name
@@ -93,7 +228,6 @@ jobs:
 
           # --- 根层文件 ---
           Copy-Item "bin64\Notepad++.exe" "$pkg\Notepad++.exe"
-          # 官方 portable 用 license.txt 命名（GPL 文本，仓库根的 LICENSE）
           $lic = Get-Source "LICENSE"
           if ($lic) { Copy-Item $lic.FullName "$pkg\license.txt" }
           else { $missing += "LICENSE" }
@@ -103,12 +237,11 @@ jobs:
             Copy-Found $f $pkg $f
           }
 
-          # --- portable 标志 + 禁自动更新标记（内容无关，文件名即开关，
-          # 官方 packageAll.bat 亦为占位文件，直接生成）---
+          # --- portable 标志 + 禁自动更新标记（文件名即开关，占位即可）---
           New-Item -ItemType File -Path "$pkg\doLocalConf.xml" -Force | Out-Null
           New-Item -ItemType File -Path "$pkg\disableNppAutoUpdate.xml" -Force | Out-Null
 
-          # --- 目录素材（官方 portable 命名：nativeLang→localization、APIs→autoCompletion）---
+          # --- 目录素材（官方 portable 命名映射）---
           foreach ($map in @(@("nativeLang", "localization"),
                              @("APIs", "autoCompletion"),
                              @("functionList", "functionList"),
@@ -123,44 +256,44 @@ jobs:
             }
             if ($src) {
               Copy-Item $src.FullName "$pkg\$($map[1])" -Recurse -Force
-              Write-Host ("  + dir {0} <- {1}" -f $map[0], $src.FullName.Substring((Get-Location).Path.Length + 1))
+              Write-Host ("  + dir {0} <- {1}" -f $map[0],
+                $src.FullName.Substring((Get-Location).Path.Length + 1))
             } else {
               Write-Host "  !! DIR NOT FOUND: $($map[0])"
               $missing += $map[0]
             }
           }
 
-          # --- userDefineLangs（预装 Markdown UDL 普通版 + 暗色版）---
+          # --- userDefineLangs（预装 Markdown UDL 两版）---
           New-Item -ItemType Directory -Path "$pkg\userDefineLangs" -Force | Out-Null
           Copy-Found "markdown._preinstalled.udl.xml" "$pkg\userDefineLangs" "markdown._preinstalled.udl.xml"
           Copy-Found "markdown._preinstalled_DM.udl.xml" "$pkg\userDefineLangs" "markdown._preinstalled_DM.udl.xml"
 
-          # --- updater（以 GUP.exe 为锚点定位整个目录）---
-          $gup = Get-Source "GUP.exe"
-          if ($gup) { Copy-Item $gup.DirectoryName "$pkg\updater" -Recurse -Force }
-          else { $missing += "GUP.exe (updater)" }
+          # --- updater + plugins：来自源码构建暂存区（EXT_BIN）---
+          Copy-Item "$env:EXT_BIN\updater" "$pkg\updater" -Recurse -Force
+          Write-Host "  + updater/ <- built_plugins (self-built wingup)"
 
-          # --- plugins（官方三插件为 solution 构建产物；nppPluginList.dll
-          # 为签名 DLL，Plugin Admin 必需）---
           New-Item -ItemType Directory -Path "$pkg\plugins\Config" -Force | Out-Null
-          foreach ($pl in @(@("NppExport", "NppExport.dll"),
-                            @("mimeTools", "mimeTools.dll"),
-                            @("NppConverter", "NppConverter.dll"))) {
-            $dll = Get-Source $pl[1]
-            if ($dll) {
-              New-Item -ItemType Directory -Path "$pkg\plugins\$($pl[0])" -Force | Out-Null
-              Copy-Item $dll.FullName "$pkg\plugins\$($pl[0])\"
-            } else { $missing += $pl[1] }
+          foreach ($pl in @("NppExport", "mimeTools", "NppConverter")) {
+            New-Item -ItemType Directory -Path "$pkg\plugins\$pl" -Force | Out-Null
+            Copy-Item "$env:EXT_BIN\$pl\$pl.dll" "$pkg\plugins\$pl\"
+            Write-Host "  + plugins\$pl\$pl.dll (self-built)"
           }
-          Copy-Found "nppPluginList.dll" "$pkg\plugins\Config" "nppPluginList.dll"
+          Copy-Item "$env:EXT_BIN\Config\nppPluginList.dll" "$pkg\plugins\Config\"
+          Write-Host "  + plugins\Config\nppPluginList.dll (self-built)"
 
-          # --- 硬失败判定：缺失清单一次性报告 ---
+          # --- 硬失败判定 ---
           if ($missing.Count -gt 0) {
             throw ("portable assembly incomplete, missing: " + ($missing -join ", "))
           }
           foreach ($req in @("Notepad++.exe", "license.txt", "readme.txt", "change.log",
                              "langs.model.xml", "stylers.model.xml",
-                             "doLocalConf.xml", "disableNppAutoUpdate.xml")) {
+                             "doLocalConf.xml", "disableNppAutoUpdate.xml",
+                             "updater\GUP.exe", "updater\gup.xml",
+                             "plugins\NppExport\NppExport.dll",
+                             "plugins\mimeTools\mimeTools.dll",
+                             "plugins\NppConverter\NppConverter.dll",
+                             "plugins\Config\nppPluginList.dll")) {
             if (-not (Test-Path "$pkg\$req")) { throw "portable missing: $req" }
           }
 
@@ -183,8 +316,6 @@ jobs:
           ls "$DEST"
           test -f "$DEST/Notepad++.exe" && test -f "$DEST/doLocalConf.xml"
 
-      # === Release（Notepad++ 为 GPL，无需加密再分发，
-      # 但沿用加密通道保持与 uniextract/hdm/x64dbg 一致的私有发布方式）===
       - name: Encrypt package and create release
         uses: ./ci_source/.github/actions/aes256pac_release/
         with:

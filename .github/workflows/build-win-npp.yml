@@ -46,13 +46,13 @@ jobs:
           ref: master
           path: pl_nppexport
 
-      # === updater（wingup：内嵌 curl 源码，需先编 curl 再编 GUP.sln）===
       - name: Checkout updater wingup
         uses: actions/checkout@main
         with:
           repository: notepad-plus-plus/wingup
           ref: master
           path: wingup
+          submodules: recursive
 
       # === Plugin Admin 插件列表（JSON → 资源 DLL）===
       - name: Checkout nppPluginList
@@ -141,27 +141,36 @@ jobs:
             } finally { Pop-Location }
           }
 
-      # === updater：先编内嵌 curl（nmake 需 VC 环境），再编 GUP.sln ===
+      # === updater：先编内嵌 curl（如存在），再编 GUP.sln ===
       - name: Build updater (wingup GUP.exe)
         shell: cmd
         run: |
-          rem windows-latest 2026-06 起默认 VS2026（路径 ...\18\Enterprise），
-          rem 版本号/edition 不能硬编码，用 vswhere 动态定位
           set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
           if not exist "%VSWHERE%" exit /b 1
           for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
           if not defined VSPATH exit /b 1
           set "VCVARS=%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
-          if not exist "%VCVARS%" exit /b 1
-          echo using VCVARS: %VCVARS%
           call "%VCVARS%"
 
-          cd wingup\curl\winbuild
-          set WINBUILD_ACKNOWLEDGE_DEPRECATED=yes
-          nmake /f Makefile.vc mode=dll RTLIBCFG=static MACHINE=x64
-          if errorlevel 1 exit /b 1
-          cd ..\..
-          msbuild vcproj\GUP.sln /m /p:Configuration=Release /p:Platform=x64
+          rem --- 动态定位 winbuild（curl 可能为子模块或路径已调整）---
+          if exist "wingup\curl\winbuild" (
+            cd wingup\curl\winbuild
+            set WINBUILD_ACKNOWLEDGE_DEPRECATED=yes
+            nmake /f Makefile.vc mode=dll RTLIBCFG=static MACHINE=x64
+            if errorlevel 1 exit /b 1
+            cd ..\..\..
+          ) else (
+            echo *** wingup\curl\winbuild not found - checking for curl dir...
+            if exist "wingup\curl" (
+              dir /b wingup\curl
+              echo *** curl dir exists but no winbuild - GUP build may fail at link
+            ) else (
+              echo *** no wingup\curl at all - GUP.sln may bundle libs or use submodule
+              dir /b wingup
+            )
+          )
+
+          msbuild wingup\vcproj\GUP.sln /m /p:Configuration=Release /p:Platform=x64
           if errorlevel 1 exit /b 1
 
       - name: Stage updater files

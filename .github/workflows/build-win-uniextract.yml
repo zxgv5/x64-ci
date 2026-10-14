@@ -27,9 +27,6 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
-      # 官网对非浏览器 UA 返回 403（winget 收录因此失败多年）
-      # 【turn1search0】【turn1search9】；直链本身有效（scoop Extras 用它收录）
-      # 【turn0fetch0】，关键是 UA。portable zip 免安装，解包即用
       - name: Install AutoIt and SciTE4AutoIt3
         shell: pwsh
         run: |
@@ -39,66 +36,81 @@ jobs:
           $zip = "$env:TEMP\SciTE4AutoIt3_Portable.zip"
           Invoke-WebRequest -Uri "https://www.autoitscript.com/autoit3/scite/download/SciTE4AutoIt3_Portable.zip" `
             -OutFile $zip -UserAgent $ua
-
-          # sha256 来自 scoop-extras manifest【turn0fetch0】，确保拿到官方原版
-          $expected = "9e41b60753b566af3333601a9720607fbf71a248c2e7225b5ee1fec0ca852722"
+          $expected = "9e41b60753b566af3333601a9720607fbf71a248c2e7225ee1fec0ca852722"
           $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $expected) { throw "SHA256 mismatch: $actual" }
-          Write-Host "SHA256 verified OK"
-
           Expand-Archive -Path $zip -DestinationPath "C:\SciTE4AutoIt3" -Force
 
-          # 诊断：确认 AutoIt3Wrapper 及其依赖都在
-          $wrapper = "C:\SciTE4AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe"
-          if (-not (Test-Path $wrapper)) {
-            Write-Host "=== portable zip content ==="
-            Get-ChildItem "C:\SciTE4AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "  $($_.FullName)" }
-            throw "AutoIt3Wrapper not in portable zip - see listing above"
+          # AutoIt3Wrapper 本体是 .au3 脚本（exe 只是其编译产物）。
+          # 上一轮诊断用 -Filter "*.exe" 把 .au3 全部隐藏了——先看 au3 在不在
+          $dirs = @("C:\SciTE4AutoIt3", "C:\Program Files (x86)\AutoIt3")
+          $wrapperAu3 = $null
+          foreach ($root in $dirs) {
+            $hit = Get-ChildItem $root -Recurse -Filter "AutoIt3Wrapper.au3" -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+            if ($hit) { $wrapperAu3 = $hit.FullName; break }
           }
-          Write-Host "AutoIt3Wrapper OK: $wrapper"
+          if ($wrapperAu3) {
+            Write-Host "AutoIt3Wrapper.au3 found: $wrapperAu3"
+            Write-Host "=== AutoIt3Wrapper directory content ==="
+            Get-ChildItem (Split-Path $wrapperAu3) | ForEach-Object { Write-Host "  $($_.Name)" }
+          } else {
+            Write-Host "=== .au3 not in portable zip, falling back to full installer ==="
+            Write-Host "--- all files under C:\SciTE4AutoIt3 ---"
+            Get-ChildItem "C:\SciTE4AutoIt3" -Recurse -File -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
+            # 完整安装器（NSIS /S）：AutoIt3Wrapper.au3 必在其中；
+            # getfile.pl 是官方跳转入口（社区 CI 实测可用）【turn0fetch0】
+            $sci = "$env:TEMP\SciTE4AutoIt3.exe"
+            Invoke-WebRequest -Uri "https://www.autoitscript.com/cgi-bin/getfile.pl?../autoit3/scite/download/SciTE4AutoIt3.exe" `
+              -OutFile $sci -UserAgent $ua
+            Start-Process -FilePath $sci -ArgumentList "/S" -Wait
+            $hit = Get-ChildItem "C:\Program Files (x86)\AutoIt3" -Recurse -Filter "AutoIt3Wrapper.au3" `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+            if (-not $hit) { throw "AutoIt3Wrapper.au3 not found after full installer" }
+            $wrapperAu3 = $hit.FullName
+            Write-Host "AutoIt3Wrapper.au3 found: $wrapperAu3"
+          }
+          "WRAPPER_AU3=$wrapperAu3" >> $env:GITHUB_ENV
 
-      # === 编译主程序 ===
-      # 通过 AutoIt3Wrapper 调用 Aut2Exe：解析源码指令后产物带
-      # 图标/版本资源。Start-Process -Wait 强制等待并捕获退出码，
-      # stdout/stderr 重定向到文件后再输出——绕开 pwsh 包装层吞输出的问题
       - name: Compile main executable
         working-directory: uniextract_source
         shell: pwsh
         run: |
-          $wrapperCandidates = @(
-            "C:\SciTE4AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe",
-            "C:\Program Files (x86)\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe",
-            "C:\Program Files\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe"
-          )
-          $wrapper = $wrapperCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
-          if (-not $wrapper) {
-            Write-Host "=== AutoIt3Wrapper not found in candidates ==="
-            Get-ChildItem "C:\Program Files*\AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "  $($_.FullName)" }
-            Get-ChildItem "C:\SciTE4AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "  $($_.FullName)" }
-            throw "AutoIt3Wrapper not found"
-          }
-          Write-Host "Using wrapper: $wrapper"
+          $autoit3 = "C:\Program Files (x86)\AutoIt3\AutoIt3.exe"
+          $wrapperAu3 = $env:WRAPPER_AU3
+          if (-not $wrapperAu3 -or -not (Test-Path $wrapperAu3)) { throw "WRAPPER_AU3 not set or missing" }
+          Write-Host "Wrapper script: $wrapperAu3"
 
           $stdout = "$env:TEMP\wrapper_out.txt"
           $stderr = "$env:TEMP\wrapper_err.txt"
-          # /in 指定脚本；指令区已声明 Outfile=.\UniExtract.exe
-          $proc = Start-Process -FilePath $wrapper `
-            -ArgumentList '/in',"UniExtract.au3",'/prod','/NoPrompt' `
+          $target = (Resolve-Path "UniExtract.au3").Path
+          # /NoStatus 抑制进度窗口；/prod 用生产版 AutoIt；
+          # /in 为绝对路径（社区 CI 的可用参数组合）【turn0fetch0】
+          $proc = Start-Process -FilePath $autoit3 `
+            -ArgumentList "`"$wrapperAu3`"",'/NoStatus','/prod','/in',"`"$target`"" `
             -WorkingDirectory (Get-Location) `
             -Wait -PassThru -NoNewWindow `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
-          Write-Host "=== AutoIt3Wrapper exit code: $($proc.ExitCode) ==="
+          Write-Host "=== exit code: $($proc.ExitCode) ==="
           Write-Host "=== stdout ==="
           Get-Content $stdout -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
           Write-Host "=== stderr ==="
           Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
 
-          if ($proc.ExitCode -ne 0 -or -not (Test-Path "UniExtract.exe")) {
-            throw "AutoIt3Wrapper failed (exit=$($proc.ExitCode))"
+          # Wrapper 内部会启动 Aut2Exe 子进程，进程退出 ≠ 产物写完。
+          # 轮询等待 UniExtract.exe 出现且大小稳定
+          $exe = Join-Path (Get-Location) "UniExtract.exe"
+          $found = $false
+          for ($i = 0; $i -lt 30; $i++) {
+            if (Test-Path $exe) {
+              $size = (Get-Item $exe).Length
+              Start-Sleep -Seconds 2
+              if ((Test-Path $exe) -and (Get-Item $exe).Length -eq $size -and $size -gt 0) { $found = $true; break }
+            } else { Start-Sleep -Seconds 2 }
           }
+          if (-not $found) { throw "UniExtract.exe not produced (exit=$($proc.ExitCode)) - see logs above" }
+          Write-Host "UniExtract.exe produced: $((Get-Item $exe).Length) bytes"
 
       # === 验证资源注入 ===
       # 快速确认图标与版本信息已进产物，否则说明 Wrapper 没接管编译

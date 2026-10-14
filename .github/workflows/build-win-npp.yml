@@ -42,7 +42,7 @@ jobs:
       - name: Checkout plugin NppExport
         uses: actions/checkout@main
         with:
-          repository: npp-plugins/export
+          repository: chcg/NPP_ExportPlugin
           ref: master
           path: pl_nppexport
 

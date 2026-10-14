@@ -27,29 +27,34 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
+      # 官网对非浏览器 UA 返回 403（winget 收录因此失败多年）
+      # 【turn1search0】【turn1search9】；直链本身有效（scoop Extras 用它收录）
+      # 【turn0fetch0】，关键是 UA。portable zip 免安装，解包即用
       - name: Install AutoIt and SciTE4AutoIt3
         shell: pwsh
         run: |
           choco install autoit -y --no-progress
 
-          # AutoIt3Wrapper.exe 为无签名 AutoIt 编译产物，是杀软误报重灾区。
-          # Defender 实时防护会在 NSIS 安装器释放它时静默隔离，制造
-          # "安装成功但文件消失"。先把目标目录加入排除再装
-          Add-MpPreference -ExclusionPath "C:\Program Files (x86)\AutoIt3"
-          Add-MpPreference -ExclusionPath "C:\SciTE4AutoIt3"
-          choco install scite4autoit3 -y --no-progress
+          $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+          $zip = "$env:TEMP\SciTE4AutoIt3_Portable.zip"
+          Invoke-WebRequest -Uri "https://www.autoitscript.com/autoit3/scite/download/SciTE4AutoIt3_Portable.zip" `
+            -OutFile $zip -UserAgent $ua
 
-          # 验证 + 诊断：若 Wrapper 仍缺失，打印 Defender 检测记录佐证
-          $wrapper = "C:\Program Files (x86)\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe"
+          # sha256 来自 scoop-extras manifest【turn0fetch0】，确保拿到官方原版
+          $expected = "9e41b60753b566af3333601a9720607fbf71a248c2e7225b5ee1fec0ca852722"
+          $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "SHA256 mismatch: $actual" }
+          Write-Host "SHA256 verified OK"
+
+          Expand-Archive -Path $zip -DestinationPath "C:\SciTE4AutoIt3" -Force
+
+          # 诊断：确认 AutoIt3Wrapper 及其依赖都在
+          $wrapper = "C:\SciTE4AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe"
           if (-not (Test-Path $wrapper)) {
-            Write-Host "=== AutoIt3Wrapper still missing ==="
-            Write-Host "--- Defender threat detections mentioning AutoIt ---"
-            Get-MpThreatDetection -ErrorAction SilentlyContinue |
-              ForEach-Object { $_.Resources } | Select-String -SimpleMatch "AutoIt" |
-              Select-Object -First 10
-            Write-Host "--- Current Defender exclusions ---"
-            (Get-MpPreference).ExclusionPath
-            throw "AutoIt3Wrapper not installed - see diagnostics above"
+            Write-Host "=== portable zip content ==="
+            Get-ChildItem "C:\SciTE4AutoIt3" -Recurse -Filter "*.exe" -ErrorAction SilentlyContinue |
+              ForEach-Object { Write-Host "  $($_.FullName)" }
+            throw "AutoIt3Wrapper not in portable zip - see listing above"
           }
           Write-Host "AutoIt3Wrapper OK: $wrapper"
 

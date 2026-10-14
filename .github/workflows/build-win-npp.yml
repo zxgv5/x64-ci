@@ -23,7 +23,8 @@ jobs:
         with:
           path: ci_source
 
-      # === 官方三插件源码（npp-plugins org，结构 src/ + vs.proj/）===
+      # === 官方三插件源码（npp-plugins org）===
+      # 注意：NppConverter/NppExport 的仓库名不带 npp 前缀
       - name: Checkout plugin mimeTools
         uses: actions/checkout@main
         with:
@@ -34,14 +35,14 @@ jobs:
       - name: Checkout plugin NppConverter
         uses: actions/checkout@main
         with:
-          repository: npp-plugins/nppconverter
+          repository: npp-plugins/converter
           ref: master
           path: pl_nppconverter
 
       - name: Checkout plugin NppExport
         uses: actions/checkout@main
         with:
-          repository: npp-plugins/nppexport
+          repository: npp-plugins/export
           ref: master
           path: pl_nppexport
 

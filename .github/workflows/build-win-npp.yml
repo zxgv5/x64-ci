@@ -142,19 +142,23 @@ jobs:
           }
 
       # === updater：先编内嵌 curl（nmake 需 VC 环境），再编 GUP.sln ===
-      # 官方构建流程：curl winbuild + nmake mode=dll RTLIBCFG=static MACHINE=x64
       - name: Build updater (wingup GUP.exe)
         shell: cmd
         run: |
-          set "VCVARS="
-          for /d %%D in ("C:\Program Files\Microsoft Visual Studio\2022\*") do (
-            if exist "%%D\VC\Auxiliary\Build\vcvars64.bat" set "VCVARS=%%D\VC\Auxiliary\Build\vcvars64.bat"
-          )
-          if not defined VCVARS exit /b 1
+          rem windows-latest 2026-06 起默认 VS2026（路径 ...\18\Enterprise），
+          rem 版本号/edition 不能硬编码，用 vswhere 动态定位
+          set "VSWHERE=C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+          if not exist "%VSWHERE%" exit /b 1
+          for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
+          if not defined VSPATH exit /b 1
+          set "VCVARS=%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
+          if not exist "%VCVARS%" exit /b 1
+          echo using VCVARS: %VCVARS%
           call "%VCVARS%"
+
           cd wingup\curl\winbuild
           set WINBUILD_ACKNOWLEDGE_DEPRECATED=yes
-          nmake /f Makefile.vc mode=dll vc=15 RTLIBCFG=static MACHINE=x64
+          nmake /f Makefile.vc mode=dll RTLIBCFG=static MACHINE=x64
           if errorlevel 1 exit /b 1
           cd ..\..
           msbuild vcproj\GUP.sln /m /p:Configuration=Release /p:Platform=x64

@@ -199,7 +199,7 @@ jobs:
             }
           } finally { Pop-Location }
 
-      # === Plugin Admin 插件列表 DLL（自编版本未签名，官方版带签名）===
+      # === Plugin Admin 插件列表 DLL（JSON → 资源 DLL）===
       - name: Build nppPluginList.dll
         shell: pwsh
         run: |
@@ -219,11 +219,11 @@ jobs:
             New-Item -ItemType Directory -Path ..\built_plugins\Config -Force | Out-Null
             Copy-Item $dll.FullName ..\built_plugins\Config\
             Write-Host "  + nppPluginList.dll (self-built, unsigned)"
-          } finally { Pop-Location }
 
-          # 传递暂存区绝对路径给组装步骤
-          $abs = (Resolve-Path ..\built_plugins).Path -replace '\\', '/'
-          "EXT_BIN=$abs" >> $env:GITHUB_ENV
+            # --- EXT_BIN 换算：用 GITHUB_WORKSPACE 绝对路径，不依赖相对层级 ---
+            $abs = Join-Path $env:GITHUB_WORKSPACE "built_plugins" -replace '\\', '/'
+            "EXT_BIN=$abs" >> $env:GITHUB_ENV
+          } finally { Pop-Location }
 
       # === 组装 portable 包（素材按文件名全树搜索定位）===
       - name: Assemble portable package

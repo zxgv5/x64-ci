@@ -63,16 +63,8 @@ jobs:
             throw "empty version info - build may be broken"
           }
 
-      # === 组装 portable 包 ===
-      # 官方 portable zip 的结构 = Notepad++.exe + 模型配置 + 语言包 +
-      # functionList + autoCompletion(APIs) + themes，全部素材在仓库内：
-      #   langs/stylers.model.xml        ← PowerEditor/src/
-      #   nativeLang/*.xml               ← PowerEditor/installer/nativeLang/
-      #   functionList/                  ← PowerEditor/installer/functionList/
-      #   APIs/*.xml (autoCompletion)    ← PowerEditor/installer/APIs/
-      #   themes/                        ← PowerEditor/installer/themes/
-      #   contextMenu/shortcuts 模型     ← PowerEditor/installer/
-      # portable 模式由根下 doLocalConf.xml 触发（配置写本地而非 %APPDATA%）
+      # === 组装 portable 包（对齐官方 packageAll.bat 的
+      # zipped.package.release64 清单）===
       - name: Assemble portable package
         working-directory: npp_source/PowerEditor
         shell: pwsh
@@ -80,52 +72,66 @@ jobs:
           $pkg = "portable"
           New-Item -ItemType Directory -Path $pkg -Force | Out-Null
 
+          # 根层文件（官方命名：license.txt；readme/change.log 为
+          # 仓库 checked-in 文本，在 bin\ 下）
           Copy-Item "bin64\Notepad++.exe" "$pkg\Notepad++.exe"
+          Copy-Item "..\..\LICENSE" "$pkg\license.txt"
+          Copy-Item "bin\readme.txt" "$pkg\"
+          Copy-Item "bin\change.log" "$pkg\"
+          Copy-Item "src\langs.model.xml" "$pkg\"
+          Copy-Item "src\stylers.model.xml" "$pkg\"
+          Copy-Item "src\tabContextMenu_example.xml" "$pkg\"
+          Copy-Item "src\toolbarButtonsConf_example.xml" "$pkg\"
+          # portable 标志 + 官方 portable 特有的禁用自动更新标记
+          Copy-Item "installer\xml4Config\doLocalConf.xml" "$pkg\"
+          Copy-Item "installer\xml4Config\disableNppAutoUpdate.xml" "$pkg\"
 
-          # 模型配置（首次启动时 NPP 自动实例化为 langs.xml 等）
-          $modelFiles = @(
-            "src\langs.model.xml", "src\stylers.model.xml",
-            "installer\config.model.xml", "installer\contextMenu.model.xml",
-            "installer\shortcuts.model.xml"
-          )
-          foreach ($f in $modelFiles) {
-            if (Test-Path $f) { Copy-Item $f "$pkg\" ; Write-Host "  + $f" }
-            else { Write-Host "  - skip (not in this version): $f" }
-          }
-
-          # 目录素材：nativeLang → localization（官方 portable 命名）
+          # 目录素材（官方 portable 命名：nativeLang→localization、APIs→autoCompletion）
           Copy-Item "installer\nativeLang" "$pkg\localization" -Recurse -Force
-          foreach ($d in @("functionList", "APIs", "themes")) {
-            if (Test-Path "installer\$d") { Copy-Item "installer\$d" "$pkg\$d" -Recurse -Force }
+          Copy-Item "installer\APIs" "$pkg\autoCompletion" -Recurse -Force
+          Copy-Item "installer\functionList" "$pkg\functionList" -Recurse -Force
+          Copy-Item "installer\themes" "$pkg\themes" -Recurse -Force
+
+          # userDefineLangs（预装 Markdown UDL 普通版 + 暗色版）
+          New-Item -ItemType Directory -Path "$pkg\userDefineLangs" -Force | Out-Null
+          Copy-Item "bin\userDefineLangs\markdown._preinstalled.udl.xml" "$pkg\userDefineLangs\"
+          Copy-Item "bin\userDefineLangs\markdown._preinstalled_DM.udl.xml" "$pkg\userDefineLangs\"
+
+          # updater（GUP.exe 等为仓库 checked-in 二进制）
+          Copy-Item "bin64\updater" "$pkg\updater" -Recurse -Force
+
+          # plugins（三个官方插件为 solution 联动构建产物；
+          # nppPluginList.dll 为仓库 checked-in 的签名 DLL）
+          New-Item -ItemType Directory -Path "$pkg\plugins\Config" -Force | Out-Null
+          Copy-Item "bin64\plugins\NppExport" "$pkg\plugins\NppExport" -Recurse -Force
+          Copy-Item "bin64\plugins\mimeTools" "$pkg\plugins\mimeTools" -Recurse -Force
+          Copy-Item "bin64\plugins\NppConverter" "$pkg\plugins\NppConverter" -Recurse -Force
+          Copy-Item "bin64\plugins\Config\nppPluginList.dll" "$pkg\plugins\Config\"
+
+          # 硬失败判定：官方清单中的关键项逐一在场
+          foreach ($req in @("Notepad++.exe", "license.txt", "readme.txt", "change.log",
+                             "langs.model.xml", "stylers.model.xml",
+                             "tabContextMenu_example.xml", "toolbarButtonsConf_example.xml",
+                             "doLocalConf.xml", "disableNppAutoUpdate.xml")) {
+            if (-not (Test-Path "$pkg\$req")) { throw "portable missing: $req" }
           }
-          # autoCompletion 官方包命名：APIs 目录内容进 autoCompletion/
-          if (Test-Path "$pkg\APIs") {
-            New-Item -ItemType Directory -Path "$pkg\autoCompletion" -Force | Out-Null
-            Copy-Item "$pkg\APIs\*" "$pkg\autoCompletion\" -Recurse -Force
-            Remove-Item "$pkg\APIs" -Recurse -Force
+          foreach ($dir in @("localization", "autoCompletion", "functionList", "themes",
+                             "userDefineLangs", "updater", "plugins\NppExport",
+                             "plugins\mimeTools", "plugins\NppConverter")) {
+            if (-not (Test-Path "$pkg\$dir")) { throw "portable missing dir: $dir" }
+          }
+          if (-not (Test-Path "$pkg\userDefineLangs\markdown._preinstalled.udl.xml")) {
+            throw "markdown UDL missing"
+          }
+          if (-not (Test-Path "$pkg\plugins\Config\nppPluginList.dll")) {
+            throw "nppPluginList.dll missing - Plugin Admin will be broken"
           }
 
-          # license / readme
-          foreach ($f in @("..\LICENSE", "..\README.md")) {
-            if (Test-Path $f) { Copy-Item $f "$pkg\" }
-          }
-
-          # portable 标志文件：配置持久化到本地目录而非 %APPDATA%
-          New-Item -ItemType File -Path "$pkg\doLocalConf.xml" -Force | Out-Null
-
-          # 硬失败判定
           $files = Get-ChildItem $pkg -Recurse -File
           $total = ($files | Measure-Object Length -Sum).Sum
           Write-Host "=== portable package: $($files.Count) files, $([math]::Round($total/1MB,1)) MB ==="
-          foreach ($req in @("Notepad++.exe", "doLocalConf.xml", "langs.model.xml", "stylers.model.xml")) {
-            if (-not (Test-Path "$pkg\$req")) { throw "portable missing: $req" }
-          }
-          if ((Get-ChildItem "$pkg\localization" -File -ErrorAction SilentlyContinue).Count -lt 40) {
-            throw "localization folder incomplete - check nativeLang copy"
-          }
-          if ($total -lt 5MB) { throw "package too small - assembly incomplete" }
+          if ($total -lt 8MB) { throw "package too small - assembly incomplete" }
           $pkgAbs = (Resolve-Path $pkg).Path -replace '\\', '/'
-          Write-Host "NPP_PKG=$pkgAbs"
           "NPP_PKG=$pkgAbs" >> $env:GITHUB_ENV
 
       - name: Rename and move

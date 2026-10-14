@@ -32,57 +32,43 @@ jobs:
         run: |
           choco install autoit -y --no-progress
 
+          # choco 的 autoit.install（官方 AutoIt 安装器）已自带 SciTE 骨架：
+          # C:\Program Files (x86)\AutoIt3\SciTE\{SciTE.exe, Tidy\, au3Stripper\, Koda\}
+          # 唯独缺 AutoIt3Wrapper（属 SciTE4AutoIt3 增量包）。
+          # 从官方 portable zip 取该文件夹放进标准位置，补齐 Wrapper
+          # 向上回溯推导 AutoIt3 根目录所需的目录层级
           $ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
           $zip = "$env:TEMP\SciTE4AutoIt3_Portable.zip"
           Invoke-WebRequest -Uri "https://www.autoitscript.com/autoit3/scite/download/SciTE4AutoIt3_Portable.zip" `
             -OutFile $zip -UserAgent $ua
-
-          # 修复：用 .CompareTo() 替代 -ne——绕开 PowerShell 运算符
-          # 对 "数字+e" 开头字符串的科学计数法类型转换陷阱
           $expected = "9e41b60753b566af3333601a9720607fbf71a248c2e7225b5ee1fec0ca852722"
           $actual = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          Write-Host "actual:   [$actual]"
-          Write-Host "expected: [$expected]"
-          if ($actual.CompareTo($expected) -ne 0) {
-            throw "SHA256 mismatch: actual=[$actual] expected=[$expected]"
-          }
+          if ($actual.CompareTo($expected) -ne 0) { throw "SHA256 mismatch: actual=[$actual]" }
           Write-Host "SHA256 verified OK"
 
-          Expand-Archive -Path $zip -DestinationPath "C:\SciTE4AutoIt3" -Force
+          $tmp = "$env:TEMP\SciTE4AutoIt3_extract"
+          Expand-Archive -Path $zip -DestinationPath $tmp -Force
+          Write-Host "=== portable zip root ==="
+          Get-ChildItem $tmp | ForEach-Object { Write-Host "  $($_.Name)" }
 
-          $dirs = @("C:\SciTE4AutoIt3", "C:\Program Files (x86)\AutoIt3")
-          $wrapperAu3 = $null
-          foreach ($root in $dirs) {
-            $hit = Get-ChildItem $root -Recurse -Filter "AutoIt3Wrapper.au3" -ErrorAction SilentlyContinue |
-              Select-Object -First 1
-            if ($hit) { $wrapperAu3 = $hit.FullName; break }
+          $sciteDir = "C:\Program Files (x86)\AutoIt3\SciTE"
+          if (-not (Test-Path "$sciteDir\SciTE.exe")) {
+            throw "choco bundled SciTE missing at $sciteDir - unexpected"
           }
-          if ($wrapperAu3) {
-            Write-Host "AutoIt3Wrapper.au3 found: $wrapperAu3"
-            Write-Host "=== AutoIt3Wrapper directory content ==="
-            Get-ChildItem (Split-Path $wrapperAu3) | ForEach-Object { Write-Host "  $($_.Name)" }
-          } else {
-            Write-Host "=== .au3 not in portable zip, falling back to full installer ==="
-            Write-Host "--- all files under C:\SciTE4AutoIt3 ---"
-            Get-ChildItem "C:\SciTE4AutoIt3" -Recurse -File -ErrorAction SilentlyContinue |
-              ForEach-Object { Write-Host "  $($_.FullName)" }
-            $sci = "$env:TEMP\SciTE4AutoIt3.exe"
-            Invoke-WebRequest -Uri "https://www.autoitscript.com/cgi-bin/getfile.pl?../autoit3/scite/download/SciTE4AutoIt3.exe" `
-              -OutFile $sci -UserAgent $ua
-            Start-Process -FilePath $sci -ArgumentList "/S" -Wait
-            $hit = Get-ChildItem "C:\Program Files (x86)\AutoIt3" -Recurse -Filter "AutoIt3Wrapper.au3" `
-              -ErrorAction SilentlyContinue | Select-Object -First 1
-            if (-not $hit) { throw "AutoIt3Wrapper.au3 not found after full installer" }
-            $wrapperAu3 = $hit.FullName
-            Write-Host "AutoIt3Wrapper.au3 found: $wrapperAu3"
-          }
+          Copy-Item "$tmp\AutoIt3Wrapper" "$sciteDir\AutoIt3Wrapper" -Recurse -Force
+
+          $wrapperAu3 = "$sciteDir\AutoIt3Wrapper\AutoIt3Wrapper.au3"
+          if (-not (Test-Path $wrapperAu3)) { throw "AutoIt3Wrapper.au3 missing after copy" }
+          Write-Host "=== AutoIt3Wrapper folder content ==="
+          Get-ChildItem (Split-Path $wrapperAu3) | ForEach-Object { Write-Host "  $($_.Name)" }
           "WRAPPER_AU3=$wrapperAu3" >> $env:GITHUB_ENV
- 
+
       - name: Compile main executable
         working-directory: uniextract_source
         shell: pwsh
         run: |
           $autoit3 = "C:\Program Files (x86)\AutoIt3\AutoIt3.exe"
+          $autoitRoot = "C:\Program Files (x86)\AutoIt3"
           $wrapperAu3 = $env:WRAPPER_AU3
           if (-not $wrapperAu3 -or -not (Test-Path $wrapperAu3)) { throw "WRAPPER_AU3 not set or missing" }
           Write-Host "Wrapper script: $wrapperAu3"
@@ -90,10 +76,10 @@ jobs:
           $stdout = "$env:TEMP\wrapper_out.txt"
           $stderr = "$env:TEMP\wrapper_err.txt"
           $target = (Resolve-Path "UniExtract.au3").Path
-          # /NoStatus 抑制进度窗口；/prod 用生产版 AutoIt；
-          # /in 为绝对路径（社区 CI 的可用参数组合）【turn0fetch0】
+          # /AutoIt3Dir 显式指定 AutoIt3 根：优先级最高（命令行 > 指令区 >
+          # 相对路径推导），兜住层级推导的任何差异【turn1fetch0】【turn3fetch0】
           $proc = Start-Process -FilePath $autoit3 `
-            -ArgumentList "`"$wrapperAu3`"",'/NoStatus','/prod','/in',"`"$target`"" `
+            -ArgumentList "`"$wrapperAu3`"", '/NoStatus', '/AutoIt3Dir', "`"$autoitRoot`"", '/prod', '/in', "`"$target`"" `
             -WorkingDirectory (Get-Location) `
             -Wait -PassThru -NoNewWindow `
             -RedirectStandardOutput $stdout -RedirectStandardError $stderr
@@ -103,8 +89,7 @@ jobs:
           Write-Host "=== stderr ==="
           Get-Content $stderr -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ }
 
-          # Wrapper 内部会启动 Aut2Exe 子进程，进程退出 ≠ 产物写完。
-          # 轮询等待 UniExtract.exe 出现且大小稳定
+          # Wrapper 内部会启动 Aut2Exe 子进程，进程退出 ≠ 产物写完。轮询等待
           $exe = Join-Path (Get-Location) "UniExtract.exe"
           $found = $false
           for ($i = 0; $i -lt 30; $i++) {

@@ -89,8 +89,6 @@ jobs:
           Write-Host "x64 PE verified OK"
 
       # === 官方三插件：从源码构建 ===
-      # 仓库结构 src/ + vs.proj/，工程文件名不硬编码，按实际搜索；
-      # 项目若锁定旧工具集，先原样构建、失败后以 v143 覆写重试
       - name: Build official plugins from source
         shell: pwsh
         run: |
@@ -103,6 +101,17 @@ jobs:
           foreach ($p in $plugins) {
             Push-Location $p.repo
             try {
+              # --- rc 预处理：afxres.h 是 MFC 头，GH runner 无 MFC 组件，
+              #    替换为 windows.h（winresrc.h 提供 IDC_STATIC 等常量，等价）---
+              Get-ChildItem . -Recurse -Filter *.rc -File | ForEach-Object {
+                $c = Get-Content $_.FullName -Raw
+                if ($c -match 'afxres\.h') {
+                  $c -replace '#\s*include\s*"afxres\.h"', '#include <windows.h>' |
+                    Set-Content $_.FullName
+                  Write-Host "  patched rc: $($_.FullName)"
+                }
+              }
+
               $proj = Get-ChildItem . -Recurse -Include *.sln -File |
                 Select-Object -First 1
               if (-not $proj) {

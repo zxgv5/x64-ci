@@ -141,7 +141,7 @@ jobs:
             } finally { Pop-Location }
           }
 
-      # === updater：curl 编译 + 落位，再编 GUP.sln ===
+      # === updater：curl（CMake，官方已废弃 winbuild/nmake 流程）+ GUP.sln ===
       - name: Build updater (wingup GUP.exe)
         shell: cmd
         run: |
@@ -151,41 +151,28 @@ jobs:
           if not defined VSPATH exit /b 1
           call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
 
-          rem === 1. curl：编译并放到 GUP.vcxproj 期望的 LIBPATH 位置 ===
+          rem === curl：官方 buildCurlAll.bat 的 x64 Release 段，静态库+静态CRT ===
+          rem 产物 curl\build\x64\lib\Release\libcurl.lib 与 GUP.vcxproj 的 LIBPATH 完全对应
           set "CURL_LIB=wingup\curl\build\x64\lib\Release\libcurl.lib"
-          if exist "%CURL_LIB%" goto curl_ok
-
-          rem -- 动态定位 winbuild（curl 版本不同路径可能不同）--
-          set "WINBUILD="
-          for /d %%D in ("wingup\curl\*") do if exist "%%~fD\Makefile.vc" set "WINBUILD=%%~fD"
-          if not defined WINBUILD set "WINBUILD=wingup\curl\winbuild"
-          if not exist "%WINBUILD%\Makefile.vc" (
-            echo *** no Makefile.vc found under wingup\curl, tree:
-            dir /s /b wingup\curl\Makefile.vc 2>nul
-            exit /b 1
-          )
-          echo using winbuild: %WINBUILD%"
-
-          pushd "%WINBUILD%"
-          set WINBUILD_ACKNOWLEDGE_DEPRECATED=yes
-          rem mode=static：官方 updater 目录不带 libcurl.dll，GUP 须静态链 curl
-          nmake /f Makefile.vc mode=static RTLIBCFG=static MACHINE=x64
-          if errorlevel 1 exit /b 1
-          popd
-
-          rem -- 产物实际落点因 curl 版本而异，全树搜索后搬到位 --
-          if not exist "wingup\curl\build\x64\lib\Release" mkdir "wingup\curl\build\x64\lib\Release"
-          for /r "wingup\curl\build" %%f in (libcurl.lib) do copy /y "%%f" "%CURL_LIB%"
-          if not exist "%CURL_LIB%" for /r "wingup\curl\build" %%f in (libcurl_a.lib) do copy /y "%%f" "%CURL_LIB%"
           if not exist "%CURL_LIB%" (
-            echo *** libcurl not produced, .lib files found in build tree:
+            echo configuring curl x64 via CMake...
+            cmake wingup\curl -B wingup\curl\build\x64 -A x64 ^
+              -DBUILD_SHARED_LIBS=OFF -DCURL_STATIC_CRT=ON -DBUILD_CURL_EXE=OFF ^
+              -DCURL_USE_SCHANNEL=ON -DCURL_USE_OPENSSL=OFF -DBUILD_TESTING=OFF ^
+              -DUSE_LIBPSL=OFF -DCURL_USE_LIBPSL=OFF -DUSE_NGHTTP2=OFF -DUSE_LIBIDN2=OFF ^
+              -DCMAKE_BUILD_TYPE=Release
+            if errorlevel 1 exit /b 1
+            cmake --build wingup\curl\build\x64 --config Release
+            if errorlevel 1 exit /b 1
+          )
+          if not exist "%CURL_LIB%" (
+            echo *** libcurl.lib still not produced:
             dir /s /b wingup\curl\build\*.lib 2>nul
             exit /b 1
           )
-          echo libcurl staged: %CURL_LIB%
+          echo libcurl ready: %CURL_LIB%
 
-          :curl_ok
-          rem === 2. GUP.sln ===
+          rem === GUP.sln（zlib/lzma/bzip2/ZipLib 上一轮已全部构建成功）===
           msbuild wingup\vcproj\GUP.sln /m /p:Configuration=Release /p:Platform=x64
           if errorlevel 1 exit /b 1
 

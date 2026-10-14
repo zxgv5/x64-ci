@@ -1,0 +1,99 @@
+name: build-win-x64dbg
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions: write-all
+    steps:
+      # === 源码：x64dbg development 分支（活跃开发主线）===
+      # 依赖四个 submodule：deps（预编译第三方 DLL）、TitanEngine、
+      # GleeBug、btparser，必须 submodules: recursive
+      - name: Checkout source repo
+        uses: actions/checkout@main
+        with:
+          repository: x64dbg/x64dbg
+          ref: development
+          path: x64dbg_source
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Checkout ci source repo
+        uses: actions/checkout@main
+        with:
+          path: ci_source
+
+      - name: Generate timestamp
+        shell: bash
+        run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+
+      # === 安装 Qt5（项目 find_package(Qt5 Widgets WinExtras)，不用 Qt6）===
+      # aqtinstall 需指定 win64_msvc2019_64 架构；WinExtras 在 Qt 5.15 可用
+      - name: Install Qt5
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '5.15.2'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+
+      # === 构建 Windows x64 Release ===
+      # 官方 wiki 命令：cmake -B build64 -A x64 + 编译 sln；
+      # X64DBG_RELEASE=ON 启用发布编译宏；deps target 由 ALL 默认
+      # 触发，windeployqt + deps/x64/ 的 DLL 自动拷到产物目录
+      - name: Build release
+        working-directory: x64dbg_source
+        shell: pwsh
+        run: |
+          cmake -B build64 -A x64 -DX64DBG_RELEASE=ON
+          cmake --build build64 --config Release --parallel
+
+          # 产物收集：x64dbg.exe（启动器）、x64gui.dll（GUI）、
+          # x64dbg.dll（DBG 核心）、x64bridge.dll（桥接层）应全部就位
+          $bin = ".\build64\bin\Release\x64"
+          if (-not (Test-Path $bin)) { $bin = ".\build64\bin\x64" }
+          Write-Host "=== built output ($bin) ==="
+          $files = Get-ChildItem $bin -Recurse -File -ErrorAction SilentlyContinue
+          $total = ($files | Measure-Object Length -Sum).Sum
+          Write-Host "=== total: $($files.Count) files, $([math]::Round($total/1MB,1)) MB ==="
+          $files | Select-Object -First 40 | ForEach-Object {
+            Write-Host ("  {0}  {1:N0} bytes" -f $_.Name, $_.Length)
+          }
+
+          # 硬失败判定：核心四件套必须齐全且总量达标
+          foreach ($core in "x64dbg.exe", "x64gui.dll", "x64dbg.dll", "x64bridge.dll") {
+            if (-not (Test-Path (Join-Path $bin $core))) {
+              throw "core component missing: $core (searched $bin)"
+            }
+          }
+          if ($files.Count -lt 20 -or $total -lt 30MB) {
+            throw "build produced $($files.Count) files, $([math]::Round($total/1MB,1)) MB - windeployqt or deps may have failed"
+          }
+          "X64DBG_BIN=$bin" >> $env:GITHUB_ENV
+
+      - name: Rename and move
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="${{ github.workspace }}/dist/x64dbg-${{ env.BUILD_DATE }}"
+          mkdir -p "$DEST"
+          cp -r "${{ env.X64DBG_BIN }}"/* "$DEST/"
+          echo "=== dist content ==="
+          du -sh "$DEST"
+          find "$DEST" -maxdepth 1 | sort
+          # 交叉验证：核心 exe + Qt 平台插件目录入场
+          [ -f "$DEST/x64dbg.exe" ] && [ -d "$DEST/platforms" ] || {
+            echo "x64dbg.exe or Qt platforms plugin missing in dist"; exit 1; }
+
+      # === Release（含 Qt5 LGPL 运行时与第三方提取器依赖，
+      # 沿用加密通道保持私有发布方式）===
+      - name: Encrypt package and create release
+        uses: ./ci_source/.github/actions/aes256pac_release/
+        with:
+          ZIP_AES256_PWD: ${{ secrets.ZIP_AES256_PWD }}
+          ZIP_COMPRESS_LEVEL: '9'
+          BUILD_ARTIFACT_PATH: "./dist/x64dbg-${{ env.BUILD_DATE }}"
+          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-x64dbg"

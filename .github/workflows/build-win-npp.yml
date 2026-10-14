@@ -141,7 +141,7 @@ jobs:
             } finally { Pop-Location }
           }
 
-      # === updater：先编内嵌 curl（如存在），再编 GUP.sln ===
+      # === updater：curl 编译 + 落位，再编 GUP.sln ===
       - name: Build updater (wingup GUP.exe)
         shell: cmd
         run: |
@@ -149,27 +149,43 @@ jobs:
           if not exist "%VSWHERE%" exit /b 1
           for /f "usebackq tokens=*" %%i in (`"%VSWHERE%" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do set "VSPATH=%%i"
           if not defined VSPATH exit /b 1
-          set "VCVARS=%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
-          call "%VCVARS%"
+          call "%VSPATH%\VC\Auxiliary\Build\vcvars64.bat"
 
-          rem --- 动态定位 winbuild（curl 可能为子模块或路径已调整）---
-          if exist "wingup\curl\winbuild" (
-            cd wingup\curl\winbuild
-            set WINBUILD_ACKNOWLEDGE_DEPRECATED=yes
-            nmake /f Makefile.vc mode=dll RTLIBCFG=static MACHINE=x64
-            if errorlevel 1 exit /b 1
-            cd ..\..\..
-          ) else (
-            echo *** wingup\curl\winbuild not found - checking for curl dir...
-            if exist "wingup\curl" (
-              dir /b wingup\curl
-              echo *** curl dir exists but no winbuild - GUP build may fail at link
-            ) else (
-              echo *** no wingup\curl at all - GUP.sln may bundle libs or use submodule
-              dir /b wingup
-            )
+          rem === 1. curl：编译并放到 GUP.vcxproj 期望的 LIBPATH 位置 ===
+          set "CURL_LIB=wingup\curl\build\x64\lib\Release\libcurl.lib"
+          if exist "%CURL_LIB%" goto curl_ok
+
+          rem -- 动态定位 winbuild（curl 版本不同路径可能不同）--
+          set "WINBUILD="
+          for /d %%D in ("wingup\curl\*") do if exist "%%~fD\Makefile.vc" set "WINBUILD=%%~fD"
+          if not defined WINBUILD set "WINBUILD=wingup\curl\winbuild"
+          if not exist "%WINBUILD%\Makefile.vc" (
+            echo *** no Makefile.vc found under wingup\curl, tree:
+            dir /s /b wingup\curl\Makefile.vc 2>nul
+            exit /b 1
           )
+          echo using winbuild: %WINBUILD%"
 
+          pushd "%WINBUILD%"
+          set WINBUILD_ACKNOWLEDGE_DEPRECATED=yes
+          rem mode=static：官方 updater 目录不带 libcurl.dll，GUP 须静态链 curl
+          nmake /f Makefile.vc mode=static RTLIBCFG=static MACHINE=x64
+          if errorlevel 1 exit /b 1
+          popd
+
+          rem -- 产物实际落点因 curl 版本而异，全树搜索后搬到位 --
+          if not exist "wingup\curl\build\x64\lib\Release" mkdir "wingup\curl\build\x64\lib\Release"
+          for /r "wingup\curl\build" %%f in (libcurl.lib) do copy /y "%%f" "%CURL_LIB%"
+          if not exist "%CURL_LIB%" for /r "wingup\curl\build" %%f in (libcurl_a.lib) do copy /y "%%f" "%CURL_LIB%"
+          if not exist "%CURL_LIB%" (
+            echo *** libcurl not produced, .lib files found in build tree:
+            dir /s /b wingup\curl\build\*.lib 2>nul
+            exit /b 1
+          )
+          echo libcurl staged: %CURL_LIB%
+
+          :curl_ok
+          rem === 2. GUP.sln ===
           msbuild wingup\vcproj\GUP.sln /m /p:Configuration=Release /p:Platform=x64
           if errorlevel 1 exit /b 1
 

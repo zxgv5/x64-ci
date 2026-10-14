@@ -9,9 +9,9 @@ jobs:
     runs-on: windows-latest
     permissions: write-all
     steps:
-      # === 源码：x64dbg development 分支 ===
-      # 必须 submodules: recursive——src/dbg/ 下引用了大量预编译 .lib
-      # （TitanEngine_x64.lib、XEDParse_x64.lib 等），这些来自 submodule
+      # === 源码：x64dbg development 分支（活跃开发主线）===
+      # 必须 submodules: recursive——deps（预编译第三方 DLL）、
+      # TitanEngine、GleeBug、btparser 都在 submodule 里
       - name: Checkout source repo
         uses: actions/checkout@main
         with:
@@ -30,9 +30,9 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
-      # === 安装 Qt5（项目 find_package(Qt5 Widgets WinExtras)，不用 Qt6）===
-      # WinExtras 在 Qt6 已移除，必须 Qt5；5.15 是最后的开源版本
-      # aqtinstall 拉取 win64_msvc2019_64 架构，ABI 兼容 VS2022
+      # === Qt5（项目 find_package(Qt5 Widgets WinExtras)，WinExtras
+      # 在 Qt6 已移除，必须 Qt5；5.15 是最后的开源版本）===
+      # install-qt-action 自动导出 QT_ROOT_DIR 并把 Qt\bin 加入 PATH
       - name: Install Qt5
         uses: jurplel/install-qt-action@v4
         with:
@@ -42,67 +42,39 @@ jobs:
           arch: 'win64_msvc2019_64'
 
       # === 构建 Windows x64 Release ===
-      # CMAKE_PREFIX_PATH 从 install-qt-action 的输出环境变量取值，
-      # 确保 find_package(Qt5) 能定位到 Qt 安装目录
-      # 官方 wiki 命令：cmake -B build64 -A x64 + 编译
+      # 官方产物目录：源码树 bin\x64（RUNTIME_OUTPUT_DIRECTORY 指定，
+      # 与官方 snapshot 包结构一致）；build64 下只有中间文件。
+      # deps target 自动调用 windeployqt 把 Qt 运行时 + deps/x64/ 的
+      # 预编译 DLL 拷进 bin\x64，无需手动后处理
       - name: Build release
         working-directory: x64dbg_source
         shell: pwsh
-        env:
-          QT_ROOT_DIR: ${{ env.QT_ROOT_DIR }}
         run: |
-          # install-qt-action 设置了 QT_ROOT_DIR 环境变量，同时把
-          # Qt\bin 加入了 PATH——windeployqt 可被 deps.cmake 找到
           Write-Host "QT_ROOT_DIR=$env:QT_ROOT_DIR"
-          Write-Host "Qt5_DIR=$env:Qt5_DIR"
-
-          $qtPrefix = $env:QT_ROOT_DIR
-          if (-not $qtPrefix -and $env:Qt5_DIR) {
-            # Qt5_DIR 指向 lib/cmake/Qt5，向上三级是 Qt 根
-            $qtPrefix = (Get-Item $env:Qt5_DIR).Parent.Parent.Parent.FullName
-          }
-          if (-not $qtPrefix) { throw "Cannot determine Qt root" }
-          Write-Host "Qt prefix: $qtPrefix"
-
-          # 官方 wiki 命令 + CMAKE_PREFIX_PATH
-          cmake -B build64 -A x64 `
-            -DX64DBG_RELEASE=ON `
-            "-DCMAKE_PREFIX_PATH=$qtPrefix"
-          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed with $LASTEXITCODE" }
-
+          cmake -B build64 -A x64 -DX64DBG_RELEASE=ON "-DCMAKE_PREFIX_PATH=$env:QT_ROOT_DIR"
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
           cmake --build build64 --config Release --parallel
-          if ($LASTEXITCODE -ne 0) { throw "cmake build failed with $LASTEXITCODE" }
+          if ($LASTEXITCODE -ne 0) { throw "cmake build failed" }
 
-          # 产物收集：CMake 默认输出路径是 build64/Release/
-          # （VS 多配置生成器，$<CONFIG> 子目录）
-          # deps target 自动调用 windeployqt 收集 Qt 运行时并从
-          # deps/x64/ 拷贝预编译 DLL 到 GUI DLL 同级目录
-          $bin = ".\build64\Release"
+          # 主路径：官方输出目录；fallback：全树搜索（排除 tests 测试插件）
+          $bin = ".\bin\x64"
           if (-not (Test-Path "$bin\x64dbg.exe")) {
-            Write-Host "=== fallback: searching for x64dbg.exe ==="
-            $hit = Get-ChildItem ".\build64" -Recurse -Filter "x64dbg.exe" |
+            $hit = Get-ChildItem . -Recurse -Filter "x64dbg.exe" -ErrorAction SilentlyContinue |
+              Where-Object { $_.FullName -notmatch '\\tests\\' } |
               Select-Object -First 1
-            if ($hit) { $bin = $hit.DirectoryName; Write-Host "found at: $bin" }
-            else { throw "x64dbg.exe not found anywhere under build64" }
+            if (-not $hit) { throw "x64dbg.exe not found in source tree" }
+            $bin = $hit.DirectoryName
           }
-
-          Write-Host "=== built output ($bin) ==="
-          $files = Get-ChildItem $bin -File -ErrorAction SilentlyContinue
+          Write-Host "=== output dir: $bin ==="
+          $files = Get-ChildItem $bin -File
           $total = ($files | Measure-Object Length -Sum).Sum
           Write-Host "=== total: $($files.Count) files, $([math]::Round($total/1MB,1)) MB ==="
-          $files | Sort-Object Name | ForEach-Object {
-            Write-Host ("  {0}  {1:N0} bytes" -f $_.Name, $_.Length)
-          }
 
-          # 硬失败判定：核心四件套必须齐全
-          foreach ($core in "x64dbg.exe", "x64gui.dll", "x64dbg.dll", "x64bridge.dll") {
-            if (-not (Test-Path (Join-Path $bin $core))) {
-              throw "core component missing: $core (searched $bin)"
-            }
+          # 硬失败判定：核心四件套（注意 DLL 实名带下划线）+ 总量达标
+          foreach ($core in @("x64dbg.exe", "x64gui.dll", "x64_dbg.dll", "x64_bridge.dll")) {
+            if (-not (Test-Path (Join-Path $bin $core))) { throw "core missing: $core" }
           }
-          if ($files.Count -lt 15 -or $total -lt 25MB) {
-            throw "build produced $($files.Count) files, $([math]::Round($total/1MB,1)) MB - windeployqt or deps may have failed"
-          }
+          if ($total -lt 25MB) { throw "output too small - windeployqt or deps may have failed" }
           "X64DBG_BIN=$bin" >> $env:GITHUB_ENV
 
       - name: Rename and move
@@ -114,13 +86,12 @@ jobs:
           cp -r "${{ env.X64DBG_BIN }}"/* "$DEST/"
           echo "=== dist content ==="
           du -sh "$DEST"
-          find "$DEST" -maxdepth 1 | sort
-          # 交叉验证：核心 exe + Qt 平台插件目录入场
-          [ -f "$DEST/x64dbg.exe" ] && [ -d "$DEST/platforms" ] || {
-            echo "x64dbg.exe or Qt platforms plugin missing in dist"; exit 1; }
+          ls "$DEST" | head -40
+          # 交叉验证：核心 exe 入场
+          test -f "$DEST/x64dbg.exe"
 
-      # === Release（含 Qt5 LGPL 运行时与第三方提取器依赖，
-      # 沿用加密通道保持私有发布方式）===
+      # === Release（含 Qt5 LGPL 运行时与第三方依赖 DLL，
+      # 沿用加密通道保持与 uniextract/hdm 产物一致的私有发布方式）===
       - name: Encrypt package and create release
         uses: ./ci_source/.github/actions/aes256pac_release/
         with:

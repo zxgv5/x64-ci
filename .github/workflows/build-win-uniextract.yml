@@ -27,12 +27,31 @@ jobs:
         shell: bash
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
-      # choco scite4autoit3 包：2024-02 审核通过，安装脚本自带
-      # 官方直链 URL + sha256 校验 + NSIS /S 静默参数【turn0find0】
       - name: Install AutoIt and SciTE4AutoIt3
         shell: pwsh
         run: |
-          choco install autoit scite4autoit3 -y --no-progress
+          choco install autoit -y --no-progress
+
+          # AutoIt3Wrapper.exe 为无签名 AutoIt 编译产物，是杀软误报重灾区。
+          # Defender 实时防护会在 NSIS 安装器释放它时静默隔离，制造
+          # "安装成功但文件消失"。先把目标目录加入排除再装
+          Add-MpPreference -ExclusionPath "C:\Program Files (x86)\AutoIt3"
+          Add-MpPreference -ExclusionPath "C:\SciTE4AutoIt3"
+          choco install scite4autoit3 -y --no-progress
+
+          # 验证 + 诊断：若 Wrapper 仍缺失，打印 Defender 检测记录佐证
+          $wrapper = "C:\Program Files (x86)\AutoIt3\SciTE\AutoIt3Wrapper\AutoIt3Wrapper.exe"
+          if (-not (Test-Path $wrapper)) {
+            Write-Host "=== AutoIt3Wrapper still missing ==="
+            Write-Host "--- Defender threat detections mentioning AutoIt ---"
+            Get-MpThreatDetection -ErrorAction SilentlyContinue |
+              ForEach-Object { $_.Resources } | Select-String -SimpleMatch "AutoIt" |
+              Select-Object -First 10
+            Write-Host "--- Current Defender exclusions ---"
+            (Get-MpPreference).ExclusionPath
+            throw "AutoIt3Wrapper not installed - see diagnostics above"
+          }
+          Write-Host "AutoIt3Wrapper OK: $wrapper"
 
       # === 编译主程序 ===
       # 通过 AutoIt3Wrapper 调用 Aut2Exe：解析源码指令后产物带

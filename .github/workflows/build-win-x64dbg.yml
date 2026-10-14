@@ -75,7 +75,12 @@ jobs:
             if (-not (Test-Path (Join-Path $bin $core))) { throw "core missing: $core" }
           }
           if ($total -lt 25MB) { throw "output too small - windeployqt or deps may have failed" }
-          "X64DBG_BIN=$bin" >> $env:GITHUB_ENV
+
+          # 关键：跨步骤传递必须用绝对路径 + 正斜杠——后续步骤运行在
+          # workspace 根，相对路径指向错误位置；bash 不认反斜杠
+          $binAbs = (Resolve-Path $bin).Path -replace '\\', '/'
+          Write-Host "X64DBG_BIN=$binAbs"
+          "X64DBG_BIN=$binAbs" >> $env:GITHUB_ENV
 
       - name: Rename and move
         shell: bash

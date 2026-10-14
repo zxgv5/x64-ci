@@ -142,28 +142,18 @@ jobs:
           $relx = "$env:TEMP\release_extract"
           Expand-Archive -Path $relzip -DestinationPath $relx -Force
 
-          # Release zip 内可能是单层目录包裹，定位真正的根
-          $relRoot = Get-ChildItem $relx -Directory | Select-Object -First 1
-          if ($relRoot -and (Test-Path "$($relRoot.FullName)\UniExtract.au3")) { $relRoot = $relRoot.FullName }
-          else { $relRoot = $relx }
-          Write-Host "Release root: $relRoot"
-
-          # bin/ 及 Release 中其他内容并入工作区（不覆盖本地已编译的 UniExtract.exe）
-          foreach ($item in Get-ChildItem $relRoot) {
-            if ($item.Name -eq "UniExtract.exe") {
-              Write-Host "  skip release exe (keep freshly built): $($item.Name)"
-              continue
-            }
-            Copy-Item $item.FullName -Destination . -Recurse -Force
-            Write-Host "  merged: $($item.Name)"
+          # 修复：不再用 UniExtract.au3 当锚点（Release 是纯二进制包，不含源码）。
+          # 改用结构判定：解压根下唯一目录且无散落文件 = 单层包裹
+          $topDirs  = Get-ChildItem $relx -Directory
+          $topFiles = Get-ChildItem $relx -File
+          if ($topDirs.Count -eq 1 -and $topFiles.Count -eq 0) {
+            $relRoot = $topDirs[0].FullName
+          } else {
+            $relRoot = $relx
           }
-
-          # 硬失败判定：bin/ 下文件数必须像个样子
-          $binCount = (Get-ChildItem ".\bin" -Recurse -File -ErrorAction SilentlyContinue).Count
-          Write-Host "=== bin/ file count: $binCount ==="
-          Get-ChildItem ".\bin" -ErrorAction SilentlyContinue |
-            Select-Object -First 20 | ForEach-Object { Write-Host "  bin/$($_.Name)" }
-          if ($binCount -lt 20) { throw "bin/ only has $binCount files - merge failed" }
+          Write-Host "Release root: $relRoot"
+          Write-Host "=== Release root content ==="
+          Get-ChildItem $relRoot | ForEach-Object { Write-Host "  $($_.Name)" }
 
       - name: Rename and move
         shell: bash

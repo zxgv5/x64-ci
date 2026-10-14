@@ -159,7 +159,7 @@ jobs:
             cmake wingup\curl -B wingup\curl\build\x64 -A x64 ^
               -DBUILD_SHARED_LIBS=OFF -DCURL_STATIC_CRT=ON -DBUILD_CURL_EXE=OFF ^
               -DCURL_USE_SCHANNEL=ON -DCURL_USE_OPENSSL=OFF -DBUILD_TESTING=OFF ^
-              -DUSE_LIBPSL=OFF -DCURL_USE_LIBPSL=OFF -DUSE_NGHTTP2=OFF -DUSE_LIBIDN2=OFF ^
+              -DCURL_USE_LIBPSL=OFF -DUSE_NGHTTP2=OFF -DUSE_LIBIDN2=OFF ^
               -DCMAKE_BUILD_TYPE=Release
             if errorlevel 1 exit /b 1
             cmake --build wingup\curl\build\x64 --config Release
@@ -221,7 +221,7 @@ jobs:
             Write-Host "  + nppPluginList.dll (self-built, unsigned)"
 
             # --- EXT_BIN 换算：用 GITHUB_WORKSPACE 绝对路径，不依赖相对层级 ---
-            $abs = Join-Path $env:GITHUB_WORKSPACE "built_plugins" -replace '\\', '/'
+            $abs = (Join-Path $env:GITHUB_WORKSPACE "built_plugins") -replace '\\', '/'
             "EXT_BIN=$abs" >> $env:GITHUB_ENV
           } finally { Pop-Location }
 
@@ -268,6 +268,8 @@ jobs:
           New-Item -ItemType File -Path "$pkg\disableNppAutoUpdate.xml" -Force | Out-Null
 
           # --- 目录素材（官方 portable 命名映射）---
+          # FIX: 兜底命中非 installer 下同名目录时，仅复制 *.xml，
+          #      防止把非语言文件（如 png/文档）一并带入 localization/
           foreach ($map in @(@("nativeLang", "localization"),
                              @("APIs", "autoCompletion"),
                              @("functionList", "functionList"),
@@ -276,14 +278,25 @@ jobs:
               Where-Object { $_.FullName -notmatch '\\build64\\' } |
               Where-Object { $_.Parent.Name -eq "installer" } |
               Select-Object -First 1
+            $fromFallback = $false
             if (-not $src) {
               $src = Get-ChildItem . -Recurse -Directory -Filter $map[0] -ErrorAction SilentlyContinue |
                 Where-Object { $_.FullName -notmatch '\\build64\\' } | Select-Object -First 1
+              $fromFallback = $true
             }
             if ($src) {
-              Copy-Item $src.FullName "$pkg\$($map[1])" -Recurse -Force
-              Write-Host ("  + dir {0} <- {1}" -f $map[0],
-                $src.FullName.Substring((Get-Location).Path.Length + 1))
+              if ($fromFallback -and $map[0] -eq "nativeLang") {
+                # 兜底目录仅收 xml，且重命名为 portable 惯例目录名
+                New-Item -ItemType Directory -Path "$pkg\$($map[1])" -Force | Out-Null
+                Get-ChildItem $src.FullName -Filter *.xml -File |
+                  Copy-Item -Destination "$pkg\$($map[1])" -Force
+                Write-Host ("  + dir {0} (xml only, fallback) <- {1}" -f $map[0],
+                  $src.FullName.Substring((Get-Location).Path.Length + 1))
+              } else {
+                Copy-Item $src.FullName "$pkg\$($map[1])" -Recurse -Force
+                Write-Host ("  + dir {0} <- {1}" -f $map[0],
+                  $src.FullName.Substring((Get-Location).Path.Length + 1))
+              }
             } else {
               Write-Host "  !! DIR NOT FOUND: $($map[0])"
               $missing += $map[0]

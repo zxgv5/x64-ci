@@ -1,0 +1,87 @@
+name: build-win-hdm
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions: write-all
+    steps:
+      # === 源码：ja7ad/hydra（Rust workspace：hya-core/hya-net 等 lib +
+      # CLI/GUI/host/updater 等 bin crates）===
+      - name: Checkout source repo
+        uses: actions/checkout@main
+        with:
+          repository: ja7ad/hydra
+          ref: main
+          path: hydra_source
+          fetch-depth: 0
+
+      - name: Checkout ci source repo
+        uses: actions/checkout@main
+        with:
+          path: ci_source
+
+      - name: Generate timestamp
+        shell: bash
+        run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+
+      # === 构建 Windows x64 release ===
+      # runner 即 x64 MSVC，宿主 target 即目标，无需 cross；
+      # GUI（iced）为纯 Rust 栈，Windows 上无需额外系统依赖，
+      # 也不需要 msvc-dev-cmd（那是给 FFI C 例程的 cl.exe 用的）
+      - name: Build release binaries
+        working-directory: hydra_source
+        shell: pwsh
+        run: |
+          # 官方 CI 的 clippy/test job 同样用 --locked：manifest 与
+          # Cargo.lock 不一致时在 PR 期即失败，而不是等到发布构建
+          cargo build --locked --release --workspace
+
+          # 产物收集：release profile 已 fat LTO + strip symbols
+          # （Cargo.toml [profile.release]），产物即 target\release\*.exe
+          $bin = ".\target\release"
+          $exes = Get-ChildItem $bin -Filter *.exe -File -ErrorAction SilentlyContinue
+          Write-Host "=== built executables ==="
+          $total = 0
+          foreach ($e in $exes) {
+            Write-Host ("  {0}  {1:N0} bytes" -f $e.Name, $e.Length)
+            $total += $e.Length
+          }
+          Write-Host ("=== total: {0} files, {1:N1} MB ===" -f $exes.Count, ($total/1MB))
+
+          # 硬失败判定：至少 1 个 exe 且总大小像 release 产物，
+          # 杜绝"绿色步骤 + 空产物"（上游 1.x 的 CLI 单体即 >5MB）
+          if ($exes.Count -lt 1 -or $total -lt 5MB) {
+            throw "release build produced $($exes.Count) exe(s), $([math]::Round($total/1MB,1)) MB - below threshold"
+          }
+
+          # 期望包含：CLI（hydra）、GUI、host、updater finisher 等 bin
+          # crates；上游 crate/binary 命名在 hya-*/hydra-* 间有过调整，
+          # 以此清单为准全量打包，不依赖具体名字
+          "HDM_BUILD_OK=1" >> $env:GITHUB_ENV
+
+      - name: Rename and move
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="${{ github.workspace }}/dist/hydra-${{ env.BUILD_DATE }}"
+          mkdir -p "$DEST"
+          cp hydra_source/target/release/*.exe "$DEST/"
+          echo "=== dist content ==="
+          du -sh "$DEST"
+          ls -la "$DEST"
+          # 交叉验证：至少一个 exe 入场且非空
+          [ -n "$(find "$DEST" -name '*.exe' -size +1M)" ] || { echo "no non-trivial exe in dist"; exit 1; }
+
+      # === Release（Rust 二进制本身无第三方再分发限制，
+      # 但沿用加密通道保持与 uniextract 产物一致的私有发布方式）===
+      - name: Encrypt package and create release
+        uses: ./ci_source/.github/actions/aes256pac_release/
+        with:
+          ZIP_AES256_PWD: ${{ secrets.ZIP_AES256_PWD }}
+          ZIP_COMPRESS_LEVEL: '9'
+          BUILD_ARTIFACT_PATH: "./dist/hydra-${{ env.BUILD_DATE }}"
+          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-hdm"

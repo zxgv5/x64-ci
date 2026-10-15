@@ -254,7 +254,10 @@ jobs:
 
           # --- 根层文件 ---
           Copy-Item "bin64\Notepad++.exe" "$pkg\Notepad++.exe"
-          $lic = Get-Source "LICENSE"
+          # FIX: LICENSE 在仓库根（PowerEditor 上一层），先取仓库根，再兜底全树搜索
+          $lic = $null
+          if (Test-Path "..\LICENSE") { $lic = Get-Item "..\LICENSE" }
+          else { $lic = Get-Source "LICENSE" }
           if ($lic) { Copy-Item $lic.FullName "$pkg\license.txt" }
           else { $missing += "LICENSE" }
           foreach ($f in "readme.txt", "change.log") { Copy-Found $f $pkg $f }

@@ -30,44 +30,50 @@ jobs:
         run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
 
       # === 构建 Windows x64 portable release ===
-      # ImHex 使用 CMake + vcpkg manifest 模式管理依赖（fmt/spdlog/imgui 等），
-      # 需要先通过 ilammy/msvc-dev-cmd 设置 MSVC 环境以获取 cl.exe 路径
       - name: Setup MSVC Dev Environment (x64)
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: amd64
 
-      - name: Install vcpkg
-        uses: friendlyanon/setup-vcpkg@v1
-        with:
-          committish: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0
+      # 修复：手动引导最新 vcpkg（替代 friendlyanon/setup-vcpkg 的旧固定提交）
+      # ImHex 的 vcpkg.json 指定 builtin-baseline 为 9e593bb...，需要 vcpkg
+      # 的 git 历史中包含此提交才能解析依赖版本（curl 8.21.0#1、
+      # vcpkg-cmake-config 2026-07-21 等较新条目）
+      - name: Setup vcpkg (latest)
+        shell: pwsh
+        run: |
+          # Full clone ensures builtin-baseline commits are reachable for version resolution
+          git clone https://github.com/microsoft/vcpkg $env:RUNNER_TEMP/vcpkg
+          & "$env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          "VCPKG_ROOT=$env:RUNNER_TEMP/vcpkg" >> $env:GITHUB_ENV
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP/vcpkg"
 
       - name: Install CMake and Ninja
         uses: lukka/get-cmake@latest
 
-      # ImHex 的 vcpkg 依赖清单位于 dist/vcpkg.json，
-      # 需复制到仓库根目录后执行 vcpkg install 以触发 manifest 模式
-      - name: Install vcpkg dependencies
+      # 复制 vcpkg.json 到根目录以启用 CMake manifest 模式
+      # （CMake 的 vcpkg toolchain 会自动检测并运行 vcpkg install）
+      - name: Prepare vcpkg manifest
         working-directory: imhex_source
         shell: pwsh
         run: |
-          Copy-Item dist/vcpkg.json vcpkg.json -Force
-          vcpkg install
-          Write-Host "=== vcpkg dependencies installed ==="
+          if (Test-Path "dist/vcpkg.json" -and -not (Test-Path "vcpkg.json")) {
+            Copy-Item "dist/vcpkg.json" "vcpkg.json" -Force
+            Write-Host "Copied vcpkg.json from dist/ to root"
+          } else {
+            Write-Host "vcpkg.json already in place or not in dist/"
+          }
 
       # CMake 配置 + 构建：
-      # 使用 vcpkg toolchain 链接 x64-windows 依赖，
-      # Ninja 单配置生成器配合 Release，
-      # install target 将 runtime DLL/资源/plugins 一并输出到 build/install/
+      # vcpkg install 会在 CMake project() 调用时通过 toolchain 自动触发，
+      # 无需单独的 vcpkg install 步骤
       - name: Configure and build release
         working-directory: imhex_source
         shell: pwsh
         run: |
-          # Configure
+          # Configure - let CMake auto-detect cl.exe from MSVC environment
           cmake -G "Ninja" -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
-            -DCMAKE_C_COMPILER="$($(Get-Command cl.exe).Path)" `
-            -DCMAKE_CXX_COMPILER="$($(Get-Command cl.exe).Path)" `
             -DCMAKE_BUILD_TYPE="Release" `
             -DCMAKE_INSTALL_PREFIX="$(Join-Path $PWD 'build\install')" `
             -DIMHEX_USE_DEFAULT_BUILD_SETTINGS=ON `
@@ -80,10 +86,10 @@ jobs:
           cmake --build build --config Release --target install --parallel
 
           # ImHex 通过检测此文件判断 portable 模式
-          "ImHex checks for the existence of this file to determine if it is running in portable mode." | 
+          "ImHex portable marker" | 
             Out-File -FilePath "build\install\PORTABLE" -Encoding ascii -NoNewline
 
-          # 产物校验：imhex.exe 必须存在且大小合理
+          # 产物校验
           $exe = Get-Item "build\install\imhex.exe" -ErrorAction SilentlyContinue
           if (-not $exe) {
             throw "build/install/imhex.exe not found - build failed"
@@ -93,11 +99,6 @@ jobs:
           if ($exe.Length -lt 5MB) {
             throw "imhex.exe is only $sizeMB MB - below threshold, likely a broken build"
           }
-
-          # 列出 portable 目录结构
-          Write-Host "=== portable install tree ==="
-          Get-ChildItem "build\install" -Recurse -File | 
-            ForEach-Object { Write-Host ("  {0}  {1:N0} bytes" -f $_.FullName.Replace("$PWD\build\install\", ""), $_.Length) }
 
           "IMHEX_BUILD_OK=1" >> $env:GITHUB_ENV
 
@@ -110,14 +111,12 @@ jobs:
           cp -r imhex_source/build/install/* "$DEST/"
           echo "=== dist content ==="
           du -sh "$DEST"
-          ls -laR "$DEST" | head -50
           # 交叉验证：exe 入场且非空
           [ -f "$DEST/imhex.exe" ] || { echo "imhex.exe missing in dist"; exit 1; }
-          [ "$(stat -c%s "$DEST/imhex.exe")" -gt 5000000 ] || { echo "imhex.exe too small in dist"; exit 1; }
+          [ "$(stat -c%s "$DEST/imhex.exe")" -gt 5000000 ] || { echo "imhex.exe too small"; exit 1; }
           [ -f "$DEST/PORTABLE" ] || { echo "PORTABLE marker missing"; exit 1; }
 
-      # === Release（ImHex 为 GPLv2，二进制再分发无障碍，
-      # 但沿用加密通道保持与 uniextract/hydra 产物一致的私有发布方式）===
+      # === Release ===
       - name: Encrypt package and create release
         uses: ./ci_source/.github/actions/aes256pac_release/
         with:

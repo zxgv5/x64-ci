@@ -37,8 +37,7 @@ jobs:
 
       # 全量克隆 vcpkg master：vcpkg 版本解析需要在 git 历史中
       # 定位 ImHex vcpkg.json 的 builtin-baseline 提交，
-      # 严禁加 --depth 1（浅克隆会导致 baseline 不可达、
-      # 版本数据库解析失败）
+      # 严禁加 --depth 1（浅克隆会导致 baseline 不可达）
       - name: Setup vcpkg (latest)
         shell: pwsh
         run: |
@@ -53,10 +52,8 @@ jobs:
 
       # 复制 manifest 到仓库根目录以启用 CMake vcpkg toolchain
       # 的 manifest 模式（toolchain 会在 project() 阶段自动执行
-      # vcpkg install）
-      # 注意：pwsh 中 -and/-or/-not 是运算符而非 cmdlet 参数，
-      # cmdlet 调用必须括号包裹： -and ...，
-      # 此处用 if/elseif 链从根上规避该写法
+      # vcpkg install）；用 if/elseif 链规避 pwsh 中 -and 运算符
+      # 与 cmdlet 参数混淆的坑
       - name: Prepare vcpkg manifest
         working-directory: imhex_source
         shell: pwsh
@@ -78,10 +75,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
 
-          # pwsh 不会因外部命令非零退出而中断：上一轮 configure 失败后
-          # 脚本仍继续跑 --build / Out-File，产生 "Ninja not found" 等
-          # 级联误导错误；此处显式检查 $LASTEXITCODE 快速失败。
-          # fetch-depth: 0 保证 ImHex 自身的 git 版本信息推导可用
+          # pwsh 不会因外部命令非零退出而中断，显式检查退出码
           cmake -G "Ninja" -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE="Release" `
@@ -90,8 +84,6 @@ jobs:
             .
           if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE)" }
 
-          # 冷缓存时 vcpkg 需编译全部依赖（curl/mbedtls/freetype/
-          # libmagic...），configure 阶段耗时较长属正常现象
           cmake --build build --target install --parallel
           if ($LASTEXITCODE -ne 0) { throw "cmake build/install failed (exit $LASTEXITCODE)" }
 
@@ -121,20 +113,43 @@ jobs:
           "ImHex checks for the existence of this file to determine if it is running in portable mode." |
             Out-File -FilePath (Join-Path $installRoot "PORTABLE") -Encoding ascii -NoNewline
 
-          # 硬失败判定：exe 存在且大小像 release 产物
-          $exe = Get-Item (Join-Path $installRoot "imhex.exe")
-          $sizeMB = [math]::Round($exe.Length / 1MB, 1)
-          Write-Host "=== imhex.exe: $sizeMB MB at $installRoot ==="
-          if ($exe.Length -lt 5MB) {
-            throw "imhex.exe is only $sizeMB MB - below threshold, likely a broken build"
+          # === 产物校验（ImHex 模块化架构专用）===
+          # imhex.exe 是薄启动器，~100 KB 属正常形态；真正的体量在
+          # libimhex.dll（核心库）+ plugins/*.hexplug + patterns/ 资源。
+          # 禁止套用 Hydra 那种 Rust 单体二进制"exe 必须 >5MB"的启发式。
+          $exe = Get-Item (Join-Path $installRoot "imhex.exe") -ErrorAction Stop
+          if ($exe.Length -lt 50KB) {
+            throw "imhex.exe launcher is only $($exe.Length) bytes - likely a broken build"
           }
+          Write-Host ("=== imhex.exe (launcher): {0:N0} bytes ===" -f $exe.Length)
 
-          # 概览：顶层条目 + 总量（不逐文件刷屏，pattern/语言文件数量庞大）
+          # 核心载荷：libimhex.dll；递归搜索兜底上游改名/挪位置，
+          # 再兜底任意 >2MB 的 DLL/.hexplug（覆盖未来拆分出 GUI dll 的情形）
+          $payload = Get-ChildItem $installRoot -Recurse -Filter "libimhex.dll" -File `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $payload) {
+            $payload = Get-ChildItem $installRoot -Recurse -Include *.dll,*.hexplug -File `
+              -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 2MB } |
+              Select-Object -First 1
+          }
+          if (-not $payload) {
+            throw "no large payload library (libimhex.dll or plugin) found under install tree"
+          }
+          Write-Host ("=== payload: {0}  {1:N1} MB ===" -f $payload.Name, ($payload.Length/1MB))
+
+          # 总量门槛：核心库 + 插件 + patterns（IMHEX_PATTERNS_PULL_MASTER
+          # 拉取的完整模式库）+ 多语言资源，解包后远大于此
+          $all = Get-ChildItem $installRoot -Recurse -File
+          $total = ($all | Measure-Object -Sum Length).Sum
+          $totalMB = [math]::Round($total/1MB, 1)
+          if ($total -lt 15MB) {
+            throw "install tree only $totalMB MB - below threshold, likely incomplete"
+          }
+          Write-Host ("=== install tree: {0} files, {1:N1} MB total ===" -f $all.Count, $totalMB)
+
+          # 概览：顶层条目（patterns/语言文件数量庞大，不逐文件刷屏）
           Write-Host "=== portable install tree (top level) ==="
           Get-ChildItem $installRoot | ForEach-Object { Write-Host ("  {0}" -f $_.Name) }
-          $all = Get-ChildItem $installRoot -Recurse -File
-          $totalMB = [math]::Round(($all | Measure-Object -Sum Length).Sum / 1MB, 1)
-          Write-Host ("=== total: {0} files, {1:N1} MB ===" -f $all.Count, $totalMB)
 
           # 传给后续 bash 步骤的绝对路径（正斜杠，规避 bash 引号/转义问题）
           $absRoot = (Join-Path $PWD $installRoot).Replace('\', '/')
@@ -152,10 +167,14 @@ jobs:
           cp -r "$SRC"/* "$DEST/"
           echo "=== dist content ==="
           du -sh "$DEST"
-          # 交叉验证：exe 入场且非空、PORTABLE 标记在场
+          # 交叉验证（与 pwsh 步骤的模块化校验对齐，不看 exe 体积）：
+          # 启动器在场 + PORTABLE 标记在场 + 核心载荷在场 + 总量达标
           [ -f "$DEST/imhex.exe" ] || { echo "imhex.exe missing in dist"; exit 1; }
-          [ "$(stat -c%s "$DEST/imhex.exe")" -gt 5000000 ] || { echo "imhex.exe too small in dist"; exit 1; }
           [ -f "$DEST/PORTABLE" ] || { echo "PORTABLE marker missing"; exit 1; }
+          [ -n "$(find "$DEST" -name 'libimhex.dll' -o -name '*.hexplug' -size +2M)" ] \
+            || { echo "no large payload library in dist"; exit 1; }
+          TOTAL_MB=$(du -sm "$DEST" | cut -f1)
+          [ "$TOTAL_MB" -ge 15 ] || { echo "dist only ${TOTAL_MB} MB - below threshold"; exit 1; }
 
       # === Release（ImHex 为 GPLv2，二进制再分发无障碍，
       # 但沿用加密通道保持与 uniextract/hydra 产物一致的私有发布方式）===

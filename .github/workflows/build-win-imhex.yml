@@ -35,88 +35,130 @@ jobs:
         with:
           arch: amd64
 
-      # 修复：手动引导最新 vcpkg（替代 friendlyanon/setup-vcpkg 的旧固定提交）
-      # ImHex 的 vcpkg.json 指定 builtin-baseline 为 9e593bb...，需要 vcpkg
-      # 的 git 历史中包含此提交才能解析依赖版本（curl 8.21.0#1、
-      # vcpkg-cmake-config 2026-07-21 等较新条目）
+      # 全量克隆 vcpkg master：vcpkg 版本解析需要在 git 历史中
+      # 定位 ImHex vcpkg.json 的 builtin-baseline 提交，
+      # 严禁加 --depth 1（浅克隆会导致 baseline 不可达、
+      # 版本数据库解析失败）
       - name: Setup vcpkg (latest)
         shell: pwsh
         run: |
-          # Full clone ensures builtin-baseline commits are reachable for version resolution
-          git clone https://github.com/microsoft/vcpkg $env:RUNNER_TEMP/vcpkg
+          git clone https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP/vcpkg"
           & "$env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg failed" }
           "VCPKG_ROOT=$env:RUNNER_TEMP/vcpkg" >> $env:GITHUB_ENV
           Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP/vcpkg"
 
       - name: Install CMake and Ninja
         uses: lukka/get-cmake@latest
 
-      # 复制 vcpkg.json 到根目录以启用 CMake manifest 模式
-      # （CMake 的 vcpkg toolchain 会自动检测并运行 vcpkg install）
+      # 复制 manifest 到仓库根目录以启用 CMake vcpkg toolchain
+      # 的 manifest 模式（toolchain 会在 project() 阶段自动执行
+      # vcpkg install）
+      # 注意：pwsh 中 -and/-or/-not 是运算符而非 cmdlet 参数，
+      # cmdlet 调用必须括号包裹： -and ...，
+      # 此处用 if/elseif 链从根上规避该写法
       - name: Prepare vcpkg manifest
         working-directory: imhex_source
         shell: pwsh
         run: |
-          if (Test-Path "dist/vcpkg.json" -and -not (Test-Path "vcpkg.json")) {
+          if (Test-Path "vcpkg.json") {
+            Write-Host "vcpkg.json already at repo root"
+          }
+          elseif (Test-Path "dist/vcpkg.json") {
             Copy-Item "dist/vcpkg.json" "vcpkg.json" -Force
-            Write-Host "Copied vcpkg.json from dist/ to root"
-          } else {
-            Write-Host "vcpkg.json already in place or not in dist/"
+            Write-Host "Copied dist/vcpkg.json -> vcpkg.json"
+          }
+          else {
+            throw "vcpkg.json not found at repo root or dist/"
           }
 
-      # CMake 配置 + 构建：
-      # vcpkg install 会在 CMake project() 调用时通过 toolchain 自动触发，
-      # 无需单独的 vcpkg install 步骤
       - name: Configure and build release
         working-directory: imhex_source
         shell: pwsh
         run: |
-          # Configure - let CMake auto-detect cl.exe from MSVC environment
+          $ErrorActionPreference = "Stop"
+
+          # pwsh 不会因外部命令非零退出而中断：上一轮 configure 失败后
+          # 脚本仍继续跑 --build / Out-File，产生 "Ninja not found" 等
+          # 级联误导错误；此处显式检查 $LASTEXITCODE 快速失败。
+          # fetch-depth: 0 保证 ImHex 自身的 git 版本信息推导可用
           cmake -G "Ninja" -B build `
             -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
             -DCMAKE_BUILD_TYPE="Release" `
             -DCMAKE_INSTALL_PREFIX="$(Join-Path $PWD 'build\install')" `
-            -DIMHEX_USE_DEFAULT_BUILD_SETTINGS=ON `
             -DIMHEX_PATTERNS_PULL_MASTER=ON `
-            -DIMHEX_COMMIT_HASH_LONG="$env:GITHUB_SHA" `
-            -DIMHEX_COMMIT_BRANCH="master" `
             .
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE)" }
 
-          # Build
-          cmake --build build --config Release --target install --parallel
+          # 冷缓存时 vcpkg 需编译全部依赖（curl/mbedtls/freetype/
+          # libmagic...），configure 阶段耗时较长属正常现象
+          cmake --build build --target install --parallel
+          if ($LASTEXITCODE -ne 0) { throw "cmake build/install failed (exit $LASTEXITCODE)" }
 
-          # ImHex 通过检测此文件判断 portable 模式
-          "ImHex portable marker" | 
-            Out-File -FilePath "build\install\PORTABLE" -Encoding ascii -NoNewline
-
-          # 产物校验
-          $exe = Get-Item "build\install\imhex.exe" -ErrorAction SilentlyContinue
-          if (-not $exe) {
-            throw "build/install/imhex.exe not found - build failed"
+          # 定位安装根目录：configure 指定的是 build\install，
+          # 若上游 CMake 内部改写了 prefix 则回退递归搜索
+          $installRoot = "build\install"
+          if (-not (Test-Path (Join-Path $installRoot "imhex.exe"))) {
+            $hit = Get-ChildItem -Path "build" -Recurse -Filter "imhex.exe" -File `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $installRoot = $hit.DirectoryName }
+            else { throw "imhex.exe not found anywhere under build/" }
           }
+
+          # 兜底：将 vcpkg 动态库补进安装根目录，保证 portable 包
+          # 在干净机器上可直接运行（若 ImHex 自身规则已覆盖则跳过）
+          $vcpkgBin = "build\vcpkg_installed\x64-windows\bin"
+          if (Test-Path $vcpkgBin) {
+            Get-ChildItem $vcpkgBin -Filter *.dll | ForEach-Object {
+              if (-not (Test-Path (Join-Path $installRoot $_.Name))) {
+                Copy-Item $_.FullName $installRoot -Force
+                Write-Host "bundled DLL: $($_.Name)"
+              }
+            }
+          }
+
+          # ImHex 运行时通过检测 exe 同目录下是否存在此文件判断 portable 模式
+          "ImHex checks for the existence of this file to determine if it is running in portable mode." |
+            Out-File -FilePath (Join-Path $installRoot "PORTABLE") -Encoding ascii -NoNewline
+
+          # 硬失败判定：exe 存在且大小像 release 产物
+          $exe = Get-Item (Join-Path $installRoot "imhex.exe")
           $sizeMB = [math]::Round($exe.Length / 1MB, 1)
-          Write-Host "=== imhex.exe: $sizeMB MB ==="
+          Write-Host "=== imhex.exe: $sizeMB MB at $installRoot ==="
           if ($exe.Length -lt 5MB) {
             throw "imhex.exe is only $sizeMB MB - below threshold, likely a broken build"
           }
 
+          # 概览：顶层条目 + 总量（不逐文件刷屏，pattern/语言文件数量庞大）
+          Write-Host "=== portable install tree (top level) ==="
+          Get-ChildItem $installRoot | ForEach-Object { Write-Host ("  {0}" -f $_.Name) }
+          $all = Get-ChildItem $installRoot -Recurse -File
+          $totalMB = [math]::Round(($all | Measure-Object -Sum Length).Sum / 1MB, 1)
+          Write-Host ("=== total: {0} files, {1:N1} MB ===" -f $all.Count, $totalMB)
+
+          # 传给后续 bash 步骤的绝对路径（正斜杠，规避 bash 引号/转义问题）
+          $absRoot = (Join-Path $PWD $installRoot).Replace('\', '/')
+          "IMHEX_INSTALL_ROOT=$absRoot" >> $env:GITHUB_ENV
           "IMHEX_BUILD_OK=1" >> $env:GITHUB_ENV
 
       - name: Rename and move
         shell: bash
         run: |
           set -euo pipefail
+          SRC="${{ env.IMHEX_INSTALL_ROOT }}"
+          [ -n "$SRC" ] || { echo "IMHEX_INSTALL_ROOT not set"; exit 1; }
           DEST="${{ github.workspace }}/dist/imhex-${{ env.BUILD_DATE }}"
           mkdir -p "$DEST"
-          cp -r imhex_source/build/install/* "$DEST/"
+          cp -r "$SRC"/* "$DEST/"
           echo "=== dist content ==="
           du -sh "$DEST"
-          # 交叉验证：exe 入场且非空
+          # 交叉验证：exe 入场且非空、PORTABLE 标记在场
           [ -f "$DEST/imhex.exe" ] || { echo "imhex.exe missing in dist"; exit 1; }
-          [ "$(stat -c%s "$DEST/imhex.exe")" -gt 5000000 ] || { echo "imhex.exe too small"; exit 1; }
+          [ "$(stat -c%s "$DEST/imhex.exe")" -gt 5000000 ] || { echo "imhex.exe too small in dist"; exit 1; }
           [ -f "$DEST/PORTABLE" ] || { echo "PORTABLE marker missing"; exit 1; }
 
-      # === Release ===
+      # === Release（ImHex 为 GPLv2，二进制再分发无障碍，
+      # 但沿用加密通道保持与 uniextract/hydra 产物一致的私有发布方式）===
       - name: Encrypt package and create release
         uses: ./ci_source/.github/actions/aes256pac_release/
         with:

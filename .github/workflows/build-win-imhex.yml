@@ -1,0 +1,127 @@
+name: build-win-imhex
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions: write-all
+    steps:
+      # === 源码：WerWolv/ImHex（CMake 工程：libimhex lib +
+      # imhex-gui/imhex CLI bin + plugins/builtin 等子模块）===
+      - name: Checkout source repo
+        uses: actions/checkout@main
+        with:
+          repository: WerWolv/ImHex
+          ref: master
+          submodules: recursive
+          path: imhex_source
+          fetch-depth: 0
+
+      - name: Checkout ci source repo
+        uses: actions/checkout@main
+        with:
+          path: ci_source
+
+      - name: Generate timestamp
+        shell: bash
+        run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+
+      # === 构建 Windows x64 portable release ===
+      # ImHex 使用 CMake + vcpkg manifest 模式管理依赖（fmt/spdlog/imgui 等），
+      # 需要先通过 ilammy/msvc-dev-cmd 设置 MSVC 环境以获取 cl.exe 路径
+      - name: Setup MSVC Dev Environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      - name: Install vcpkg
+        uses: friendlyanon/setup-vcpkg@v1
+        with:
+          committish: ef7dbf94b9198bc58f45951adcf1f041fcbc5ea0
+
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+
+      # ImHex 的 vcpkg 依赖清单位于 dist/vcpkg.json，
+      # 需复制到仓库根目录后执行 vcpkg install 以触发 manifest 模式
+      - name: Install vcpkg dependencies
+        working-directory: imhex_source
+        shell: pwsh
+        run: |
+          Copy-Item dist/vcpkg.json vcpkg.json -Force
+          vcpkg install
+          Write-Host "=== vcpkg dependencies installed ==="
+
+      # CMake 配置 + 构建：
+      # 使用 vcpkg toolchain 链接 x64-windows 依赖，
+      # Ninja 单配置生成器配合 Release，
+      # install target 将 runtime DLL/资源/plugins 一并输出到 build/install/
+      - name: Configure and build release
+        working-directory: imhex_source
+        shell: pwsh
+        run: |
+          # Configure
+          cmake -G "Ninja" -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_C_COMPILER="$($(Get-Command cl.exe).Path)" `
+            -DCMAKE_CXX_COMPILER="$($(Get-Command cl.exe).Path)" `
+            -DCMAKE_BUILD_TYPE="Release" `
+            -DCMAKE_INSTALL_PREFIX="$(Join-Path $PWD 'build\install')" `
+            -DIMHEX_USE_DEFAULT_BUILD_SETTINGS=ON `
+            -DIMHEX_PATTERNS_PULL_MASTER=ON `
+            -DIMHEX_COMMIT_HASH_LONG="$env:GITHUB_SHA" `
+            -DIMHEX_COMMIT_BRANCH="master" `
+            .
+
+          # Build
+          cmake --build build --config Release --target install --parallel
+
+          # ImHex 通过检测此文件判断 portable 模式
+          "ImHex checks for the existence of this file to determine if it is running in portable mode." | 
+            Out-File -FilePath "build\install\PORTABLE" -Encoding ascii -NoNewline
+
+          # 产物校验：imhex.exe 必须存在且大小合理
+          $exe = Get-Item "build\install\imhex.exe" -ErrorAction SilentlyContinue
+          if (-not $exe) {
+            throw "build/install/imhex.exe not found - build failed"
+          }
+          $sizeMB = [math]::Round($exe.Length / 1MB, 1)
+          Write-Host "=== imhex.exe: $sizeMB MB ==="
+          if ($exe.Length -lt 5MB) {
+            throw "imhex.exe is only $sizeMB MB - below threshold, likely a broken build"
+          }
+
+          # 列出 portable 目录结构
+          Write-Host "=== portable install tree ==="
+          Get-ChildItem "build\install" -Recurse -File | 
+            ForEach-Object { Write-Host ("  {0}  {1:N0} bytes" -f $_.FullName.Replace("$PWD\build\install\", ""), $_.Length) }
+
+          "IMHEX_BUILD_OK=1" >> $env:GITHUB_ENV
+
+      - name: Rename and move
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEST="${{ github.workspace }}/dist/imhex-${{ env.BUILD_DATE }}"
+          mkdir -p "$DEST"
+          cp -r imhex_source/build/install/* "$DEST/"
+          echo "=== dist content ==="
+          du -sh "$DEST"
+          ls -laR "$DEST" | head -50
+          # 交叉验证：exe 入场且非空
+          [ -f "$DEST/imhex.exe" ] || { echo "imhex.exe missing in dist"; exit 1; }
+          [ "$(stat -c%s "$DEST/imhex.exe")" -gt 5000000 ] || { echo "imhex.exe too small in dist"; exit 1; }
+          [ -f "$DEST/PORTABLE" ] || { echo "PORTABLE marker missing"; exit 1; }
+
+      # === Release（ImHex 为 GPLv2，二进制再分发无障碍，
+      # 但沿用加密通道保持与 uniextract/hydra 产物一致的私有发布方式）===
+      - name: Encrypt package and create release
+        uses: ./ci_source/.github/actions/aes256pac_release/
+        with:
+          ZIP_AES256_PWD: ${{ secrets.ZIP_AES256_PWD }}
+          ZIP_COMPRESS_LEVEL: '9'
+          BUILD_ARTIFACT_PATH: "./dist/imhex-${{ env.BUILD_DATE }}"
+          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-imhex"

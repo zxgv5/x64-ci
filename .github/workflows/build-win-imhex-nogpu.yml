@@ -1,0 +1,230 @@
+name: build-win-imhex-nogpu
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions: write-all
+    steps:
+      # === 源码：WerWolv/ImHex（CMake 工程：libimhex lib +
+      # imhex-gui/imhex CLI bin + plugins/builtin 等子模块）===
+      - name: Checkout source repo
+        uses: actions/checkout@main
+        with:
+          repository: WerWolv/ImHex
+          ref: master
+          submodules: recursive
+          path: imhex_source
+          fetch-depth: 0
+
+      - name: Checkout ci source repo
+        uses: actions/checkout@main
+        with:
+          path: ci_source
+
+      - name: Generate timestamp
+        shell: bash
+        run: echo "BUILD_DATE=$(TZ=UTC-8 date +"%y.%m.%d-%H.%M.%S")" >> $GITHUB_ENV
+
+      # === 构建 Windows x64 portable release ===
+      - name: Setup MSVC Dev Environment (x64)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: amd64
+
+      # 全量克隆 vcpkg master：vcpkg 版本解析需要在 git 历史中
+      # 定位 ImHex vcpkg.json 的 builtin-baseline 提交，
+      # 严禁加 --depth 1（浅克隆会导致 baseline 不可达）
+      - name: Setup vcpkg (latest)
+        shell: pwsh
+        run: |
+          git clone https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP/vcpkg"
+          & "$env:RUNNER_TEMP/vcpkg/bootstrap-vcpkg.bat" -disableMetrics
+          if ($LASTEXITCODE -ne 0) { throw "bootstrap-vcpkg failed" }
+          "VCPKG_ROOT=$env:RUNNER_TEMP/vcpkg" >> $env:GITHUB_ENV
+          Add-Content $env:GITHUB_PATH "$env:RUNNER_TEMP/vcpkg"
+
+      - name: Install CMake and Ninja
+        uses: lukka/get-cmake@latest
+
+      # 复制 manifest 到仓库根目录以启用 CMake vcpkg toolchain
+      # 的 manifest 模式；用 if/elseif 链规避 pwsh 中 -and 运算符
+      # 与 cmdlet 参数混淆的坑
+      - name: Prepare vcpkg manifest
+        working-directory: imhex_source
+        shell: pwsh
+        run: |
+          if (Test-Path "vcpkg.json") {
+            Write-Host "vcpkg.json already at repo root"
+          }
+          elseif (Test-Path "dist/vcpkg.json") {
+            Copy-Item "dist/vcpkg.json" "vcpkg.json" -Force
+            Write-Host "Copied dist/vcpkg.json -> vcpkg.json"
+          }
+          else {
+            throw "vcpkg.json not found at repo root or dist/"
+          }
+
+      - name: Configure and build release
+        working-directory: imhex_source
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          # pwsh 不会因外部命令非零退出而中断，显式检查退出码
+          cmake -G "Ninja" -B build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" `
+            -DCMAKE_BUILD_TYPE="Release" `
+            -DCMAKE_INSTALL_PREFIX="$(Join-Path $PWD 'build\install')" `
+            -DIMHEX_PATTERNS_PULL_MASTER=ON `
+            .
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed (exit $LASTEXITCODE)" }
+
+          cmake --build build --target install --parallel
+          if ($LASTEXITCODE -ne 0) { throw "cmake build/install failed (exit $LASTEXITCODE)" }
+
+          # 定位安装根目录：configure 指定的是 build\install，
+          # 若上游 CMake 内部改写了 prefix 则回退递归搜索
+          $installRoot = "build\install"
+          if (-not (Test-Path (Join-Path $installRoot "imhex.exe"))) {
+            $hit = Get-ChildItem -Path "build" -Recurse -Filter "imhex.exe" -File `
+              -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hit) { $installRoot = $hit.DirectoryName }
+            else { throw "imhex.exe not found anywhere under build/" }
+          }
+
+          # 硬性要求：将 vcpkg 动态库全部补进安装根目录。
+          # ImHex 的 CMake install 规则只拷自身产物（exe/libimhex/plugins/
+          # patterns），vcpkg 的第三方 DLL 需要显式搬运——
+          # 这是 portable 包能跑起来的前提条件
+          $vcpkgBin = "build\vcpkg_installed\x64-windows\bin"
+          if (-not (Test-Path $vcpkgBin)) {
+            # 兜底：manifest 模式默认路径不在时全量搜索
+            $vcpkgBin = (Get-ChildItem "build" -Recurse -Directory -Filter "bin" |
+              Where-Object { $_.FullName -match "vcpkg_installed" -and $_.FullName -match "x64-windows" } |
+              Select-Object -First 1).FullName
+          }
+          if ($vcpkgBin -and (Test-Path $vcpkgBin)) {
+            $copied = 0
+            Get-ChildItem $vcpkgBin -Filter *.dll | ForEach-Object {
+              if (-not (Test-Path (Join-Path $installRoot $_.Name))) {
+                Copy-Item $_.FullName $installRoot -Force
+                $copied++
+                Write-Host "bundled DLL: $($_.Name)"
+              }
+            }
+            Write-Host "=== copied $copied vcpkg DLL(s) into install root ==="
+          }
+          else {
+            throw "vcpkg bin directory not found - cannot bundle runtime DLLs"
+          }
+
+          # ImHex 运行时通过检测 exe 同目录下是否存在此文件判断 portable 模式
+          "ImHex checks for the existence of this file to determine if it is running in portable mode." |
+            Out-File -FilePath (Join-Path $installRoot "PORTABLE") -Encoding ascii -NoNewline
+
+          # === 产物校验（ImHex 模块化架构专用）===
+          $exe = Get-Item (Join-Path $installRoot "imhex.exe") -ErrorAction Stop
+          if ($exe.Length -lt 50KB) {
+            throw "imhex.exe launcher is only $($exe.Length) bytes - likely a broken build"
+          }
+          Write-Host ("=== imhex.exe (launcher): {0:N0} bytes ===" -f $exe.Length)
+
+          # 核心载荷：libimhex.dll；递归搜索兜底上游改名/挪位置
+          $payload = Get-ChildItem $installRoot -Recurse -Filter "libimhex.dll" -File `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $payload) {
+            $payload = Get-ChildItem $installRoot -Recurse -Include *.dll,*.hexplug -File `
+              -ErrorAction SilentlyContinue | Where-Object { $_.Length -gt 2MB } |
+              Select-Object -First 1
+          }
+          if (-not $payload) {
+            throw "no large payload library (libimhex.dll or plugin) found under install tree"
+          }
+          Write-Host ("=== payload: {0}  {1:N1} MB ===" -f $payload.Name, ($payload.Length/1MB))
+
+          # 资源校验：patterns 目录必须非空（IMHEX_PATTERNS_PULL_MASTER
+          # 拉取的完整模式库），magic 数据库也应在位
+          $patternsDir = Join-Path $installRoot "patterns"
+          if (-not (Test-Path $patternsDir) -or
+              -not (Get-ChildItem $patternsDir -File -ErrorAction SilentlyContinue)) {
+            Write-Host "::warning::patterns directory empty or missing"
+          }
+          $magicFile = Get-ChildItem $installRoot -Recurse -Filter "magic.mgc" -File `
+            -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($magicFile) {
+            Write-Host "=== magic.mgc: $($magicFile.FullName) ==="
+          }
+          else {
+            Write-Host "::warning::magic.mgc not found (libmagic may fail at runtime)"
+          }
+
+          # 总量门槛
+          $all = Get-ChildItem $installRoot -Recurse -File
+          $total = ($all | Measure-Object -Sum Length).Sum
+          $totalMB = [math]::Round($total/1MB, 1)
+          if ($total -lt 15MB) {
+            throw "install tree only $totalMB MB - below threshold, likely incomplete"
+          }
+          Write-Host ("=== install tree: {0} files, {1:N1} MB total ===" -f $all.Count, $totalMB)
+
+          # 传给后续 bash 步骤的绝对路径（正斜杠，规避 bash 引号/转义问题）
+          $absRoot = (Join-Path $PWD $installRoot).Replace('\', '/')
+          "IMHEX_INSTALL_ROOT=$absRoot" >> $env:GITHUB_ENV
+          "IMHEX_BUILD_OK=1" >> $env:GITHUB_ENV
+
+      # === NoGPU 兜底：注入 Mesa3D 软件渲染 opengl32.dll ===
+      # ImHex 的 GLFW 窗口在无法创建 OpenGL 3.0+ 上下文时会静默退出
+      # （任务栏图标闪现 2 秒后消失，无任何错误弹窗），官方为此维护
+      # NoGPU 变体；此处按官方 CI 同源做法下载 Mesa3D llvmpipe 构建
+      # 注入 install root，保证产物在无 GPU / 驱动异常 / RDP 环境可启动
+      - name: Inject Mesa3D software OpenGL (NoGPU fallback)
+        working-directory: ${{ github.workspace }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          INSTALL_ROOT="${{ env.IMHEX_INSTALL_ROOT }}"
+          [ -n "$INSTALL_ROOT" ] || { echo "IMHEX_INSTALL_ROOT not set"; exit 1; }
+          # 官方 CI 同源下载点（build.yml "Download Mesa3D for NoGPU version" 步骤）
+          curl --connect-timeout 30 --retry 5 --retry-delay 0 --retry-max-time 30 \
+            "https://downloads.fdossena.com/geth.php?r=mesa64-latest" -L -o mesa.7z
+          7z e mesa.7z -y > /dev/null
+          [ -f opengl32.dll ] || { echo "opengl32.dll not extracted from mesa.7z"; exit 1; }
+          mv opengl32.dll "$INSTALL_ROOT/"
+          echo "NoGPU version Powered by Mesa 3D : https://fdossena.com/?p=mesa%2Findex.frag" \
+            > "$INSTALL_ROOT/MESA.md"
+          echo "=== injected Mesa3D opengl32.dll ($(stat -c%s "$INSTALL_ROOT/opengl32.dll") bytes) ==="
+
+      - name: Rename and move
+        shell: bash
+        run: |
+          set -euo pipefail
+          SRC="${{ env.IMHEX_INSTALL_ROOT }}"
+          [ -n "$SRC" ] || { echo "IMHEX_INSTALL_ROOT not set"; exit 1; }
+          DEST="${{ github.workspace }}/dist/imhex-nogpu-${{ env.BUILD_DATE }}"
+          mkdir -p "$DEST"
+          cp -r "$SRC"/* "$DEST/"
+          echo "=== dist content ==="
+          du -sh "$DEST"
+          # 交叉验证：启动器在场 + PORTABLE 标记在场 + 核心载荷在场
+          # + opengl32.dll 兜底在场 + 总量达标
+          [ -f "$DEST/imhex.exe" ] || { echo "imhex.exe missing in dist"; exit 1; }
+          [ -f "$DEST/PORTABLE" ] || { echo "PORTABLE marker missing"; exit 1; }
+          [ -f "$DEST/opengl32.dll" ] || { echo "opengl32.dll (NoGPU fallback) missing"; exit 1; }
+          [ -n "$(find "$DEST" -name 'libimhex.dll' -o -name '*.hexplug' -size +2M)" ] \
+            || { echo "no large payload library in dist"; exit 1; }
+          TOTAL_MB=$(du -sm "$DEST" | cut -f1)
+          [ "$TOTAL_MB" -ge 15 ] || { echo "dist only ${TOTAL_MB} MB - below threshold"; exit 1; }
+
+      # === Release（ImHex 为 GPLv2，二进制再分发无障碍，
+      # 但沿用加密通道保持与 uniextract/hydra 产物一致的私有发布方式）===
+      - name: Encrypt package and create release
+        uses: ./ci_source/.github/actions/aes256pac_release/
+        with:
+          ZIP_AES256_PWD: ${{ secrets.ZIP_AES256_PWD }}
+          ZIP_COMPRESS_LEVEL: '9'
+          BUILD_ARTIFACT_PATH: "./dist/imhex-nogpu-${{ env.BUILD_DATE }}"
+          RELEASE_TAG_NAME: "${{ env.BUILD_DATE }}-imhex-nogpu"
